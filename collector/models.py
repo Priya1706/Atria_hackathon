@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 METRICS = {
-    "cpu_utilization", "memory_utilization", "disk_utilization", "network_latency_ms",
+    "cpu_utilization", "memory_utilization", "disk_utilization", "bandwidth_utilization_percent", "network_latency_ms",
     "packet_loss_percent", "service_availability", "connectivity",
     "failed_auth_attempts", "security_event_summary",
 }
@@ -49,6 +49,22 @@ class TelemetryInput(BaseModel):
             return value
         if not math.isfinite(value):
             raise ValueError("metric_value must be finite")
+        return value
+
+    @field_validator("metric_value")
+    @classmethod
+    def metric_range(cls, value: float | bool, info):
+        if isinstance(value, bool):
+            return value
+        metric = info.data.get("metric_name")
+        if metric in {"cpu_utilization", "memory_utilization", "disk_utilization", "bandwidth_utilization_percent", "packet_loss_percent"} and not 0 <= value <= 100:
+            raise ValueError(f"{metric} must be between 0 and 100 percent")
+        if metric == "service_availability" and not 0 <= value <= 1:
+            raise ValueError("service_availability must be between 0 and 1")
+        if metric in {"network_latency_ms", "failed_auth_attempts", "security_event_summary"} and value < 0:
+            raise ValueError(f"{metric} must be non-negative")
+        if metric == "connectivity" and value not in (0, 1):
+            raise ValueError("connectivity must be 0 or 1")
         return value
 
 

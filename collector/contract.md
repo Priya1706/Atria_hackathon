@@ -1,27 +1,28 @@
-# Proposed collector to SaaS contract
+# Collector ↔ SaaS integration contract
 
-**Status: proposed, not confirmed.** The local collector implements the payload format below because it was supplied in the CICADA backend prompt. Amit should confirm the path, authentication, units, acknowledgement semantics, and duplicate behavior before the two services are connected. No SaaS destination URL is hard-coded.
+This contract is matched to Amit's implementation under `backend/app/`. Its endpoint, API-key header, request fields, and duplicate response were verified against the actual route/schema and automated tests in this repository.
 
 ## Request
 
-- Method/path: `POST /api/v1/ingest/telemetry` (configure the full URL through `SAAS_INGEST_URL`).
-- Authentication: `X-API-Key: <key>` from `SAAS_API_KEY`, sent only over HTTPS.
-- Idempotency: `Idempotency-Key: <batch_id>` plus the same stable `batch_id` in the JSON body. The SaaS service should deduplicate on this identifier.
-- Tenant: deliberately omitted. The SaaS service derives tenant identity from the API key.
-- Content type: `application/json`.
+- `POST /api/v1/ingest/telemetry`
+- Header: `X-API-Key: <provisioned collector key>`
+- Content type: `application/json`
+- `Idempotency-Key: <batch_id>` is also sent by the collector; SaaS batch deduplication uses `batch_id` in the body.
+- Development can use HTTP only on localhost/loopback. Deployed communication requires HTTPS.
+- Tenant ID is never in the body. SaaS derives the tenant from the API key and verifies that `collector_id` belongs to that key.
 
-## Payload schema version 1.0
+## JSON payload (`schema_version` 1.0)
 
 ```json
 {
   "schema_version": "1.0",
-  "batch_id": "unique-uuid",
+  "batch_id": "uuid",
   "collector_id": "collector-001",
   "timestamp": "2026-11-20T10:30:00Z",
   "metrics": [
     {
-      "metric_id": "unique-event-uuid",
-      "source": "24-char-pseudonymous-id",
+      "metric_id": "uuid",
+      "source": "24-character-HMAC-pseudonym",
       "metric_name": "cpu_usage",
       "value": 78.5,
       "unit": "percent",
@@ -31,38 +32,40 @@
 }
 ```
 
-| Field | Required | Meaning |
+`schema_version`, `batch_id`, `collector_id`, batch `timestamp`, and `metrics` are required. `metadata` is optional in the SaaS schema but the collector omits it. Each metric requires `metric_id` (UUID), `source`, `metric_name`, numeric `value`, `unit`, and measurement `timestamp`. No other per-metric fields are accepted by SaaS.
+
+The metric mapping is isolated in `collector/saas_contract.py`:
+
+| Local collector metric | SaaS name | Unit / meaning |
 |---|---|---|
-| `schema_version` | yes | Version of this wire format. |
-| `batch_id` | yes | Stable UUID used for retries and deduplication. |
-| `collector_id` | yes | Configured collector identity. |
-| `timestamp` | yes | UTC batch creation time in ISO 8601. |
-| `metrics` | yes | One or more approved metric records. |
-| `metric_id` | yes | Stable event UUID retained across retries. |
-| `source` | yes | HMAC pseudonym; original host/source identifier is not exported. |
-| `metric_name` | yes | SaaS metric name mapped by `collector/saas_contract.py`. |
-| `value` | yes | Finite numeric/boolean telemetry value. |
-| `unit` | yes | Normalized unit string. |
-| `timestamp` | yes | Measurement time normalized to UTC. |
+| `cpu_utilization` | `cpu_usage` | percent |
+| `memory_utilization` | `memory_usage` | percent |
+| `disk_utilization` | `disk_usage` | percent |
+| `bandwidth_utilization_percent` | `bandwidth_usage` | percent of configured/observed link capacity |
+| `network_latency_ms` | `network_latency` | ms |
+| `packet_loss_percent` | `packet_loss` | percent |
+| `connectivity` | `connectivity` | ratio, 0 or 1 |
+| `service_availability` | `service_availability` | ratio, 0 through 1 |
+| `failed_auth_attempts` | `failed_authentication_count` | count |
+| `security_event_summary` | `security_event_count` | count |
 
-Input-to-contract metric mapping is centralized in `collector/saas_contract.py`. It covers CPU, memory, disk, latency, packet loss, connectivity, availability, failed authentication count, and security event count. Raw logs, tenant ID, local category/severity, source timezone, passwords, tokens, personal data, and unapproved fields do not appear in this schema.
+Bandwidth input is utilization percent, not an invented throughput estimate. A real adapter must obtain it from the supplied infrastructure agent/counter and convert observed bytes per interval to utilization using known link capacity. The included simulator's 42% value is synthetic only.
 
-## Response expectations to confirm with SaaS owner
+## Responses and idempotency
 
-The collector currently treats **any 2xx** response as successful delivery and retains the batch ID for deduplication. Proposed responses:
+- `200`, `status: success`: batch accepted and records processed.
+- `409`, `status: duplicate`, matching `batch_id`: the same batch was already processed. This is a safe acknowledgement. Collector marks it `sent` and stops retrying.
+- `409`, `status: error`: a metric ID was reused or another payload conflict occurred. This is not an acknowledgement; collector retains the batch as `failed` and retries with backoff for operator review.
+- `401`/`403`: missing/invalid key or collector identity mismatch. Retained and retried; check provisioning/configuration.
+- `422`: schema or validation error. Retained and retried; fix the collector contract/input.
+- network errors, `429`, and `5xx`: retained and retried with the same batch ID and exact body.
 
-- `200` or `201`: `{"status":"accepted","batch_id":"<same-id>"}`.
-- Duplicate: preferably `200` with `{"status":"duplicate","batch_id":"<same-id>"}` so retries can be acknowledged as delivered.
-- `400`/`422`: permanent schema/validation error. Current collector records failure and retries with bounded exponential delay; a permanent-failure/DLQ policy needs agreement.
-- `401`/`403`: invalid API key; current collector keeps the batch locally and retries with backoff.
-- `429`/`5xx`/network error: transient failure; retry the same body and batch ID.
+Collector only accepts the duplicate response if HTTP status is 409, JSON `status` equals `duplicate`, and the response `batch_id` equals the outgoing batch ID. It does not infer success from a 409 message. Other 409 responses remain failures.
 
-Response body is not parsed yet. Confirm duplicate status codes, error format, and whether `Retry-After` must be honored.
+## Central processing and provisioning
 
-## Local privacy and egress proof
+The SaaS backend validates metric UUIDs and collector identity, derives tenant from `X-API-Key`, stores the batch atomically, runs health/anomaly/incident/recommendation processing, and rejects globally reused metric IDs. For local development, provision a tenant/collector/key with `python -m backend.dev_provision`; the command is disabled unless `APP_ENV` is development, dev, or test. It prints the generated key once. Store it in ignored `.env` as `SAAS_API_KEY`.
 
-Raw records are stored only in local SQLite. `make_batch` builds a new object from an explicit field mapping, and `Store.enqueue` hashes and stores the exact compact JSON string. HTTP transport sends that same string. Egress records contain batch ID, collector, destination, approved/removed/redacted fields, SHA-256 payload hash, exact JSON, status, attempt count, last attempt, and safe error type. The audit API decodes field-list columns but leaves `payload_json` as the exact string.
+## Egress audit
 
-## Frontend routes
-
-The local collector API remains loopback-only by default and has OpenAPI at `/docs`. It does not expose raw SQLite input. `GET /collector/egress` and `GET /collector/egress/{payload_id}` provide audit metadata and the exact outgoing JSON body.
+The collector records the exact compact JSON before sending, along with its SHA-256, batch/collector IDs, approved/removed/redacted field names, destination, attempt count, last attempt, and safe error class. The request body sent on every retry is byte-for-byte the audited string. Raw local records, credentials, tenant identity, and original source identifiers are excluded.

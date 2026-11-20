@@ -1,62 +1,70 @@
-# Collector demo guide
+# End-to-end local demo
 
-## Start it
+## Install and configure
 
-In PowerShell from the repository root:
+Run from repository root in PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+python -m pip install -r backend/requirements.txt
 Copy-Item .env.example .env
+```
+
+Provision a fresh local tenant, collector, and key:
+
+```powershell
+python -m backend.dev_provision --tenant-name 'CICADA Demo' --collector-name 'Local Collector'
+```
+
+Copy the one-time generated API key into `.env` as `SAAS_API_KEY`; set `COLLECTOR_TENANT_ID` and `COLLECTOR_ID` there to the IDs printed by the command. Keep the `.env` private and ignored.
+
+## Start both services
+
+Open one PowerShell window for each service.
+
+SaaS service, port 8000:
+
+```powershell
+python -m backend.main
+```
+
+Collector, port 8001:
+
+```powershell
 python -m collector.main
 ```
 
-Open `http://127.0.0.1:8000/docs` for interactive API documentation. SQLite stores the demo database in `collector.db`.
+Open `http://127.0.0.1:8000/docs` and `http://127.0.0.1:8001/docs` for OpenAPI.
 
-## Generate sample telemetry
-
-In another PowerShell window:
+## Generate, send, inspect
 
 ```powershell
-Invoke-RestMethod -Method Post http://127.0.0.1:8000/collector/demo
-Invoke-RestMethod http://127.0.0.1:8000/collector/status | ConvertTo-Json -Depth 6
-Invoke-RestMethod http://127.0.0.1:8000/collector/metrics | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/demo
+Invoke-RestMethod http://127.0.0.1:8001/collector/status | ConvertTo-Json -Depth 6
+Invoke-RestMethod http://127.0.0.1:8001/collector/egress | ConvertTo-Json -Depth 8
 ```
 
-The generated telemetry is invented and tagged `simulated`; it is not organizer-provided input.
+The synthetic adapter creates ten metrics including bandwidth utilization; these are demo values, not organizer telemetry. When both services are ready and `.env` has the key, the collector's background worker sends the batch to SaaS. Observe the queue record transition to `sent`.
 
-## Show the privacy and egress proof
+Inspect central persistence using the tenant ID printed during provisioning:
 
 ```powershell
-$batch = Invoke-RestMethod http://127.0.0.1:8000/collector/egress
-$batch | Select-Object batch_id, status, payload_hash, approved_fields, fields_removed, fields_redacted | ConvertTo-Json -Depth 6
-Invoke-RestMethod "http://127.0.0.1:8000/collector/egress/$($batch[0].batch_id)" | ConvertTo-Json -Depth 8
+$headers = @{ 'X-Tenant-ID' = '<tenant id from provisioning>' }
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/telemetry -Headers $headers | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/health -Headers $headers | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/anomalies -Headers $headers | ConvertTo-Json -Depth 8
 ```
 
-The detail response includes `payload_json`. Explain that this is the same string the sender transmits and that its SHA-256 is recorded alongside it. It contains metric values and a pseudonymous source, but no tenant ID, raw log, password, or original host identifier.
+Dashboard APIs use `X-Tenant-ID`; the telemetry ingestion endpoint instead authenticates with `X-API-Key` and derives the tenant server-side.
 
-## Demonstrate validation and local collection
+## Retry and idempotency
+
+The automated E2E test simulates SaaS accepting a batch but the response being lost. The collector retries identical audited JSON; SaaS answers 409 `status: duplicate`; collector marks the matching batch `sent`. A separate case reuses a metric UUID in a new batch, receives 409 `status: error`, and remains failed. No live SaaS server is required for that test.
+
+Run the full suite:
 
 ```powershell
-$body = @{
-  events = @(@{
-    tenant_id = 'demo-tenant'
-    collector_id = 'collector-001'
-    timestamp_utc = [DateTime]::UtcNow.ToString('o')
-    source_timezone = 'Asia/Calcutta'
-    metric_name = 'cpu_utilization'
-    metric_value = 47.5
-    source_identifier = 'private-host-01'
-    password = 'local-only-demo-secret'
-    raw_log = 'local-only demo log text'
-  })
-} | ConvertTo-Json -Depth 8
-Invoke-RestMethod -Method Post http://127.0.0.1:8000/collector/collect -ContentType 'application/json' -Body $body
+python -m pytest -q
 ```
-
-Then inspect `/collector/egress`; those private values should be listed as removed/redacted and should not appear inside `payload_json`.
-
-## SaaS retry demo
-
-The test suite uses mocked HTTP responses to exercise outage and recovery without Amit's server. For a real integration demo, first confirm the endpoint and authentication contract with Amit. Set `SAAS_INGEST_URL` to the agreed full HTTPS endpoint and `SAAS_API_KEY` in the ignored `.env`; then collect a batch and observe its queue status change from pending to sent (or failed/backoff if unavailable). Never use a real production key for a public demo.

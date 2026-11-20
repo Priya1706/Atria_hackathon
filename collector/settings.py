@@ -10,7 +10,7 @@ def _load_dotenv():
     if not env_file.is_file():
         return
     try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
@@ -27,7 +27,7 @@ _load_dotenv()
 class Settings:
     database_path: str = os.getenv("COLLECTOR_DB", "collector.db")
     host: str = os.getenv("COLLECTOR_HOST", "127.0.0.1")
-    port: int = int(os.getenv("COLLECTOR_PORT", "8000"))
+    port: int = int(os.getenv("COLLECTOR_PORT", "8001"))
     tenant_id: str = os.getenv("COLLECTOR_TENANT_ID", "demo-tenant")
     collector_id: str = os.getenv("COLLECTOR_ID", "collector-001")
     saas_url: str = os.getenv("SAAS_INGEST_URL", "")

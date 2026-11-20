@@ -20,7 +20,7 @@ import collector.transport as transport
 
 
 def sample(**updates):
-    data = dict(tenant_id="demo-tenant", collector_id="collector-001", timestamp_utc=datetime.now(timezone.utc), source_timezone="Asia/Calcutta", metric_name="cpu_utilization", metric_value=42.0, source_identifier="host-secret-name", password="dont-export", api_key="key-123", raw_log="private log text", sensitive_payload={"ssn": "123"}, unknown="nope")
+    data = dict(tenant_id="demo-tenant", collector_id="collector-001", timestamp_utc=datetime.now(timezone.utc), source_timezone="Asia/Calcutta", metric_name="cpu_utilization", metric_value=42.0, source_identifier="host-secret-name", password="dont-export", api_key="key-123", raw_log="private log text", sensitive_payload={"ssn": "SSN_SECRET_MARKER_9283746501"}, unknown="nope")
     data.update(updates)
     return TelemetryInput(**data)
 
@@ -33,7 +33,7 @@ def pipeline_settings(monkeypatch, **updates):
 
 def health_events(cpu, timestamp=None):
     timestamp = timestamp or datetime.now(timezone.utc)
-    values = {"cpu_utilization": cpu, "memory_utilization": 20, "disk_utilization": 25, "network_latency_ms": 20, "packet_loss_percent": 0, "service_availability": 1, "connectivity": 1, "failed_auth_attempts": 0, "security_event_summary": 0}
+    values = {"cpu_utilization": cpu, "memory_utilization": 20, "disk_utilization": 25, "bandwidth_utilization_percent": 35, "network_latency_ms": 20, "packet_loss_percent": 0, "service_availability": 1, "connectivity": 1, "failed_auth_attempts": 0, "security_event_summary": 0}
     return [sample(metric_name=name, metric_value=value, timestamp_utc=timestamp, password=None, api_key=None, raw_log=None, sensitive_payload=None, unknown=None) for name, value in values.items()]
 
 
@@ -78,7 +78,7 @@ def test_allowlist_drops_sensitive_values_and_records_removed_fields(tmp_path, m
     Pipeline(store).accept([sample()])
     row = store.rows("egress")[0]
     payload = row["payload_json"]
-    for secret in ("dont-export", "key-123", "private log text", "123", "nope", "demo-tenant", "host-secret-name"):
+    for secret in ("dont-export", "key-123", "private log text", "SSN_SECRET_MARKER_9283746501", "nope", "demo-tenant", "host-secret-name"):
         assert secret not in payload
     assert "tenant_id" in row["fields_removed"] and "password" in row["fields_removed"]
     assert "password" in row["fields_redacted"] and "raw_log" in row["fields_redacted"]

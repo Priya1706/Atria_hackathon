@@ -1,8 +1,35 @@
+# Python environments
 .venv/
+venv/
+env/
+
+# Python runtime/cache
 __pycache__/
 *.py[cod]
-.pytest_cache/
-collector.db
-collector.db-shm
-collector.db-wal
+*$py.class
+
+# Secrets and local settings
 .env
+.env.*
+!.env.example
+*.local
+
+# Local databases/state (collector and SaaS)
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Tests, coverage and build output
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# IDE/editor and OS files
+.vscode/
+.idea/
+.DS_Store

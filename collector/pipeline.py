@@ -13,7 +13,7 @@ from .store import Store
 
 EXPORT_FIELDS = ("metric_id", "source", "metric_name", "value", "unit", "timestamp")
 SENSITIVE_NAMES = {"password", "api_key", "token", "secret", "raw_log", "log", "sensitive_payload", "authorization", "email", "phone", "ssn"}
-REQUIRED_HEALTH_METRICS = {"cpu_utilization", "memory_utilization", "disk_utilization", "network_latency_ms", "packet_loss_percent", "service_availability", "connectivity"}
+REQUIRED_HEALTH_METRICS = {"cpu_utilization", "memory_utilization", "disk_utilization", "bandwidth_utilization_percent", "network_latency_ms", "packet_loss_percent", "service_availability", "connectivity"}
 
 
 class Pipeline:
@@ -111,12 +111,13 @@ class Pipeline:
                     loss = latest_by_metric["packet_loss_percent"]
                     auth = latest_by_metric.get("failed_auth_attempts", 0)
                     disk = latest_by_metric["disk_utilization"]
+                    bandwidth = latest_by_metric["bandwidth_utilization_percent"]
                     memory = latest_by_metric["memory_utilization"]
                     latency = latest_by_metric["network_latency_ms"]
                     availability = latest_by_metric["service_availability"]
                     connected = latest_by_metric["connectivity"]
                     security = latest_by_metric.get("security_event_summary", 0)
-                    score = max(cpu, disk, memory, loss * 10, auth * 10, security * 10, min(100, latency / 10), 100 if availability < 1 else 0, 100 if connected < 1 else 0)
+                    score = max(cpu, disk, memory, bandwidth, loss * 10, auth * 10, security * 10, min(100, latency / 10), 100 if availability < 1 else 0, 100 if connected < 1 else 0)
                     if score >= settings.health_poor_threshold:
                         new = "Poor"
                     elif score >= settings.health_fair_threshold:
@@ -125,7 +126,7 @@ class Pipeline:
                         new = "Good"
                     else:
                         new = "Excellent"
-                    reason = f"Telemetry health score {score:g}; based on latest CPU, memory, disk, latency, packet loss, availability, connectivity, and security counts."
+                    reason = f"Telemetry health score {score:g}; based on latest CPU, memory, disk, bandwidth use, latency, packet loss, availability, connectivity, and security counts."
         if new != self.health:
             previous = self.health
             self.health = new

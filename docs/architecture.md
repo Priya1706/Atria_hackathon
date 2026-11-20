@@ -1,27 +1,31 @@
-# Collector architecture
+# Integrated backend architecture
 
-## Boundaries
+There are two independent FastAPI processes and two SQLite files:
 
-The collector's main security boundary is the `make_batch` function in `collector/saas_contract.py`. It creates the SaaS JSON from normalized values, using a fixed mapping. The local incoming Pydantic model permits extra keys so varied agents can submit private fields, but no input dictionary is used as the outgoing object. The SaaS payload deliberately omits `tenant_id`; the central service is expected to derive tenant identity from its API key.
+| Service | Module | Default local address | Database setting |
+|---|---|---|---|
+| Local collector | `collector.app:app` via `python -m collector.main` | `127.0.0.1:8001` | `COLLECTOR_DB` (`collector.db`) |
+| Central SaaS | `backend.app.main:app` via Uvicorn | `127.0.0.1:8000` | `DATABASE_PATH` (`backend/saas_platform.db`) |
 
-Raw input is stored in the local `events.raw_json` SQLite column. Collector endpoints only return normalized metadata, and no raw-record read route exists. Host/source identifiers are transformed using HMAC-SHA256 and `PSEUDONYM_SALT`. Passwords, API credentials, raw logs, personal data, and unknown fields are absent from the schema built for SaaS.
+The root `.env.example` lists both sets. Collector variables use `COLLECTOR_`/`SAAS_` prefixes; SaaS variables use `APP_ENV`, `HOST`, `PORT`, `DATABASE_PATH`, and engine-specific names. Each process reads the root `.env`; OS environment variables have priority. Dependencies are declared separately and intentionally use compatible FastAPI/Pydantic/HTTPX versions.
 
-## Persistence
+## Data flow
 
-SQLite tables hold normalized event columns plus local raw JSON, anomaly results, state transitions, the egress queue/audit record, and baseline measurements. Egress rows are written before network delivery. `payload_json` is the actual string passed to HTTPX and `payload_hash` is its SHA-256. A unique batch primary key, HTTP idempotency header, atomic claim, and sent-state exclusion prevent ordinary application retries from creating new SaaS batches.
+1. Collector validates source records, preserves raw input only in collector SQLite, normalizes measurement time to UTC, and computes local baseline/health signals.
+2. A contract adapter constructs a new batch with a UUID `batch_id`, configured `collector_id`, UTC batch time, and metric records with UUID `metric_id`, HMAC pseudonym `source`, mapped name/value/unit/time.
+3. Collector records exact compact JSON and SHA-256 in its egress queue before network I/O. Tenant ID, raw logs, credentials, and original source identifiers are not sent.
+4. The configured API key is sent in `X-API-Key`. SaaS authentication maps that key to an active collector and tenant; the JSON tenant is not accepted. SaaS also verifies that payload collector ID matches the registered collector.
+5. SaaS stores each batch/metric atomically, rejects reused metric UUIDs, and runs central anomaly detection, health calculation, incident correlation, and recommendations.
+6. The collector retries network/server/validation errors with the same exact body and ID. A 409 is acknowledged only when its JSON has `status: duplicate` and a matching `batch_id`; a 409 metric-ID `status: error` remains failed.
 
-An `inflight` batch older than 60 seconds is returned to `pending` at startup. This gives a crashed process a recovery path while avoiding immediate reclaims from another live process. Run one Uvicorn worker per local database.
+## Contract and privacy boundary
 
-## Analysis
+See [collector/contract.md](../collector/contract.md). `collector/saas_contract.py` holds the outbound field mapping. Source names are replaced with HMAC-SHA256 pseudonyms. The collector's audit includes approved/removed/redacted field names, destination, attempt timestamps, and the exact request string/hash.
 
-The baseline uses up to 20 previous values for the same metric whose measurement timestamps are no later than the current reading. It waits for three prior readings. An anomaly is raised when the absolute deviation is at least the larger of 25% of the baseline or one metric unit. The record gives observed value, baseline, signed deviation, severity, and an explanation with the actual sample count.
+## Metric compatibility
 
-Health requires recent CPU, memory, disk, latency, packet loss, service availability, and connectivity. Missing required measurements or stale latest input yields `Fair` with a reason. Otherwise a transparent score maps the worst current metric to `Excellent`, `Good`, `Fair`, or `Poor` using environment thresholds. Each change is stored with UTC time and reason.
+CPU, memory, disk, bandwidth utilization, latency, packet loss, connectivity, availability, failed auth counts, and security event counts map to explicit SaaS names. Health and anomaly rules are maintained centrally for each. Unknown metrics are Fair in SaaS health until deliberately configured. The synthetic adapter uses made-up bandwidth percent values; a real input adapter must derive percent utilization from a local bandwidth counter and known link capacity.
 
-## Retry and integration
+## Development and security
 
-The lifespan starts an asynchronous loop that runs the synchronous HTTP sender in a worker thread. A manual transmit endpoint uses the same sender. SQLite claims batches before sending; errors are stored as safe exception class names and retried with capped exponential backoff. Both URL and API key are required; the URL must use HTTPS. Any HTTP 2xx is currently treated as accepted. Confirm duplicate response codes, `Retry-After`, and permanent-error behavior with the SaaS owner.
-
-## Safe local operation
-
-`collector.main` binds Uvicorn to loopback. Routes have no local authentication and are intended for development/demo on the same machine. Do not bind to a public or shared network without an agreed access-control layer. TLS is verified for SaaS requests; credentials never appear in payloads or logs.
+Provision a dev tenant and collector with `python -m backend.dev_provision`; generated API keys are printed once and should be kept in ignored `.env`. Provisioning is disabled in production. The SaaS MVP stores these keys in plaintext in SQLite; restrict this workflow to demo credentials. Collector accepts HTTP only to loopback addresses for local integration; all remote transmission requires HTTPS and normal certificate verification. Keep both APIs bound to loopback during development. The local collector API has no local authentication.
