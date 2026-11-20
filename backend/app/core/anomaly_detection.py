@@ -3,8 +3,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from backend.app.db.repository import TelemetryRepository
-
-ANOMALY_COOLDOWN_SECONDS = 300  # 5-minute suppression window for duplicate anomalies
+from backend.app.config import ANOMALY_COOLDOWN_SECONDS
 
 STATIC_THRESHOLDS = {
     "cpu_usage": {"warning": 85.0, "critical": 92.0},
@@ -28,6 +27,7 @@ def detect_anomaly_for_metric(
     metric_id: Optional[str],
     timestamp: str,
     repo: TelemetryRepository,
+    exclude_metric_ids: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Evaluates whether an incoming metric is anomalous using:
@@ -35,8 +35,22 @@ def detect_anomaly_for_metric(
     2. Threshold-based fallback when history is sparse.
     3. Cooldown-based duplicate suppression.
     """
-    # 1. Fetch recent history for baseline calculation
-    history = repo.get_metric_history(tenant_id, source, metric_name, limit=20)
+    # Canonical UTC ordering makes ISO timestamps comparable across Z and offset forms.
+    current_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if current_dt.tzinfo is None:
+        current_dt = current_dt.replace(tzinfo=timezone.utc)
+    current_dt = current_dt.astimezone(timezone.utc)
+    current_timestamp = current_dt.isoformat()
+
+    # Only strictly earlier records are eligible; all incoming batch ids are
+    # explicitly excluded so same-batch readings never influence one another.
+    excluded_ids = list(exclude_metric_ids or [])
+    if metric_id:
+        excluded_ids.append(metric_id)
+    history = repo.get_metric_history(
+        tenant_id, source, metric_name, limit=20,
+        before_timestamp=current_timestamp, exclude_metric_ids=list(set(excluded_ids)),
+    )
     baseline_value = None
     is_anomaly = False
     severity = "WARNING"
@@ -72,7 +86,10 @@ def detect_anomaly_for_metric(
                     severity = "WARNING"
                 explanation = (
                     f"{metric_name} observed at {observed_value} is {percent_above_baseline:+.1f}% "
-                    f"above moving baseline ({baseline_value}). Deviation exceeds 2 sigma threshold."
+                    f"above the prior-sample mean ({baseline_value}) using {len(history)} readings "
+                    f"(sample standard deviation {std_dev:.2f}); deviation is "
+                    f"{deviation_amount:.2f} and meets the 2-sigma or 30% rule. "
+                    f"Minimum warning floor: {warning_floor}."
                 )
 
     # Fallback to threshold-based detection if history is sparse or baseline didn't catch it
@@ -90,10 +107,11 @@ def detect_anomaly_for_metric(
         return None
 
     # 2. Check duplicate suppression cooldown
-    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    since_ts = (dt - timedelta(seconds=ANOMALY_COOLDOWN_SECONDS)).isoformat()
+    since_ts = (current_dt - timedelta(seconds=ANOMALY_COOLDOWN_SECONDS)).isoformat()
 
-    if repo.has_recent_identical_anomaly(tenant_id, source, metric_name, severity, since_ts):
+    if repo.has_recent_identical_anomaly(
+        tenant_id, source, metric_name, severity, since_ts, current_timestamp
+    ):
         # Suppress duplicate anomaly within cooldown window
         return None
 
@@ -109,7 +127,7 @@ def detect_anomaly_for_metric(
         baseline_value=baseline_value,
         severity=severity,
         explanation=explanation,
-        detected_at=timestamp,
+        detected_at=current_timestamp,
     )
 
     return {
@@ -121,7 +139,7 @@ def detect_anomaly_for_metric(
         "baseline_value": baseline_value,
         "severity": severity,
         "explanation": explanation,
-        "detected_at": timestamp,
+        "detected_at": current_timestamp,
     }
 
 
@@ -132,6 +150,7 @@ def process_batch_anomalies(
 ) -> List[Dict[str, Any]]:
     """Evaluates all metrics in an ingested batch for anomalies."""
     detected = []
+    batch_metric_ids = [str(metric["metric_id"]) for metric in metrics]
     for m in metrics:
         anom = detect_anomaly_for_metric(
             tenant_id=tenant_id,
@@ -141,6 +160,7 @@ def process_batch_anomalies(
             metric_id=str(m["metric_id"]),
             timestamp=m["timestamp"],
             repo=repo,
+            exclude_metric_ids=batch_metric_ids,
         )
         if anom:
             detected.append(anom)

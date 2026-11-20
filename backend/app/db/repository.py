@@ -180,17 +180,26 @@ class TelemetryRepository:
         return row["cnt"] if row else 0
 
     def get_metric_history(
-        self, tenant_id: str, source: str, metric_name: str, limit: int = 20
+        self, tenant_id: str, source: str, metric_name: str, limit: int = 20,
+        before_timestamp: Optional[str] = None,
+        exclude_metric_ids: Optional[List[str]] = None,
     ) -> List[float]:
-        """Fetches historical values for baseline calculation."""
+        """Fetches strictly earlier values, optionally excluding an entire incoming batch."""
         cursor = self.conn.cursor()
+        query = """SELECT value FROM telemetry_records
+            WHERE tenant_id = ? AND source = ? AND metric_name = ?"""
+        params: List[Any] = [tenant_id, source, metric_name]
+        if before_timestamp is not None:
+            query += " AND julianday(timestamp) < julianday(?)"
+            params.append(before_timestamp)
+        if exclude_metric_ids:
+            placeholders = ",".join("?" for _ in exclude_metric_ids)
+            query += f" AND metric_id NOT IN ({placeholders})"
+            params.extend(exclude_metric_ids)
+        query += " ORDER BY julianday(timestamp) DESC, timestamp DESC, metric_id DESC LIMIT ?"
+        params.append(limit)
         cursor.execute(
-            """
-            SELECT value FROM telemetry_records
-            WHERE tenant_id = ? AND source = ? AND metric_name = ?
-            ORDER BY timestamp DESC LIMIT ?
-            """,
-            (tenant_id, source, metric_name, limit),
+            query, tuple(params),
         )
         rows = cursor.fetchall()
         return [r["value"] for r in rows]
@@ -210,15 +219,17 @@ class TelemetryRepository:
             """
             SELECT t1.*
             FROM telemetry_records t1
-            INNER JOIN (
-                SELECT metric_name, MAX(timestamp) AS max_time
-                FROM telemetry_records
-                WHERE tenant_id = ? AND source = ?
-                GROUP BY metric_name
-            ) t2 ON t1.metric_name = t2.metric_name AND t1.timestamp = t2.max_time
             WHERE t1.tenant_id = ? AND t1.source = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM telemetry_records t2
+                WHERE t2.tenant_id = t1.tenant_id AND t2.source = t1.source
+                  AND t2.metric_name = t1.metric_name
+                  AND (julianday(t2.timestamp) > julianday(t1.timestamp)
+                       OR (julianday(t2.timestamp) = julianday(t1.timestamp)
+                           AND t2.metric_id > t1.metric_id))
+              )
             """,
-            (tenant_id, source, tenant_id, source),
+            (tenant_id, source),
         )
         return cursor.fetchall()
 
@@ -262,19 +273,20 @@ class TelemetryRepository:
         self.conn.commit()
 
     def has_recent_identical_anomaly(
-        self, tenant_id: str, source: str, metric_name: str, severity: str, since_timestamp: str
+        self, tenant_id: str, source: str, metric_name: str, severity: str, since_timestamp: str,
+        through_timestamp: Optional[str] = None,
     ) -> bool:
         """Suppresses duplicate anomalies for identical metric & severity within cooldown window."""
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT 1 FROM anomalies
+        query = """SELECT 1 FROM anomalies
             WHERE tenant_id = ? AND source = ? AND metric_name = ? AND severity = ?
-              AND detected_at >= ?
-            LIMIT 1
-            """,
-            (tenant_id, source, metric_name, severity, since_timestamp),
-        )
+              AND julianday(detected_at) >= julianday(?)"""
+        params: List[Any] = [tenant_id, source, metric_name, severity, since_timestamp]
+        if through_timestamp is not None:
+            query += " AND julianday(detected_at) <= julianday(?)"
+            params.append(through_timestamp)
+        query += " LIMIT 1"
+        cursor.execute(query, tuple(params))
         return cursor.fetchone() is not None
 
     def get_tenant_anomalies(
@@ -305,18 +317,21 @@ class TelemetryRepository:
     # Incidents
     # -------------------------------------------------------------
     def find_active_incident(
-        self, tenant_id: str, source: str, since_timestamp: str
+        self, tenant_id: str, source: str, since_timestamp: str,
+        through_timestamp: Optional[str] = None,
     ) -> Optional[sqlite3.Row]:
-        """Finds open/acknowledged incident for this tenant & source within correlation window."""
+        """Finds an active incident for this tenant/source inside the requested time window."""
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM incidents
+        query = """SELECT * FROM incidents
             WHERE tenant_id = ? AND affected_source = ? AND status IN ('OPEN', 'ACKNOWLEDGED')
-              AND last_updated_at >= ?
-            ORDER BY last_updated_at DESC LIMIT 1
-            """,
-            (tenant_id, source, since_timestamp),
+              AND julianday(last_updated_at) >= julianday(?)"""
+        params: List[Any] = [tenant_id, source, since_timestamp]
+        if through_timestamp is not None:
+            query += " AND julianday(last_updated_at) <= julianday(?)"
+            params.append(through_timestamp)
+        query += " ORDER BY julianday(last_updated_at) DESC LIMIT 1"
+        cursor.execute(
+            query, tuple(params),
         )
         return cursor.fetchone()
 
@@ -454,6 +469,60 @@ class TelemetryRepository:
             ),
         )
         self.conn.commit()
+
+    def refresh_recommendation_for_incident_metric(
+        self, tenant_id: str, incident_id: str, title: str,
+        explanation: str, suggested_action: str, severity: str,
+    ) -> bool:
+        """Refreshes existing recommendation evidence without inserting a duplicate."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """UPDATE recommendations SET explanation = ?, suggested_action = ?, severity = ?
+               WHERE recommendation_id = (
+                   SELECT recommendation_id FROM recommendations
+                   WHERE tenant_id = ? AND incident_id = ? AND title = ?
+                   ORDER BY created_at DESC LIMIT 1
+               )""",
+            (explanation, suggested_action, severity, tenant_id, incident_id, title),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_latest_anomaly_for_metric(
+        self, tenant_id: str, source: str, metric_name: str,
+        from_timestamp: Optional[str] = None,
+        through_timestamp: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        query = """SELECT * FROM anomalies WHERE tenant_id = ? AND source = ? AND metric_name = ?"""
+        params: List[Any] = [tenant_id, source, metric_name]
+        if from_timestamp is not None:
+            query += " AND julianday(detected_at) >= julianday(?)"
+            params.append(from_timestamp)
+        if through_timestamp is not None:
+            query += " AND julianday(detected_at) <= julianday(?)"
+            params.append(through_timestamp)
+        query += " ORDER BY julianday(detected_at) DESC LIMIT 1"
+        cursor.execute(
+            query, tuple(params),
+        )
+        return cursor.fetchone()
+
+    def get_latest_metric_for_source(
+        self, tenant_id: str, source: str, metric_name: str,
+        through_timestamp: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        query = """SELECT * FROM telemetry_records WHERE tenant_id = ? AND source = ? AND metric_name = ?"""
+        params: List[Any] = [tenant_id, source, metric_name]
+        if through_timestamp is not None:
+            query += " AND julianday(timestamp) <= julianday(?)"
+            params.append(through_timestamp)
+        query += " ORDER BY julianday(timestamp) DESC, metric_id DESC LIMIT 1"
+        cursor.execute(
+            query, tuple(params),
+        )
+        return cursor.fetchone()
 
     def get_tenant_recommendations(
         self, tenant_id: str, limit: int = 50

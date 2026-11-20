@@ -2,6 +2,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from backend.app.db.repository import TelemetryRepository
+from backend.app.core.anomaly_detection import LOWER_IS_ANOMALOUS, STATIC_THRESHOLDS
+
+
+def _event_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 RECOMMENDATION_TEMPLATES = {
     "cpu_usage": {
@@ -52,14 +60,46 @@ def generate_recommendations_for_incident(
     source = incident["affected_source"]
     severity = incident["severity"]
     related_metrics = incident.get("related_metrics", [])
+    lower_bound = incident.get("first_detected_at")
+    upper_bound = incident.get("last_updated_at")
 
     for metric_name in related_metrics:
-        # Find corresponding anomaly for observed value details
-        matching_anomaly = next(
-            (a for a in anomalies if a["source"] == source and a["metric_name"] == metric_name),
-            None,
+        # Prefer current batch detail, then persisted anomaly evidence so an
+        # incident update never loses values from its earlier contributing metrics.
+        batch_candidates = [
+            anomaly for anomaly in anomalies
+            if anomaly["source"] == source and anomaly["metric_name"] == metric_name
+            and (lower_bound is None or _event_time(anomaly["detected_at"]) >= _event_time(lower_bound))
+            and (upper_bound is None or _event_time(anomaly["detected_at"]) <= _event_time(upper_bound))
+        ]
+        matching_anomaly = (
+            max(batch_candidates, key=lambda item: _event_time(item["detected_at"]))
+            if batch_candidates else None
         )
-        observed_val = matching_anomaly["observed_value"] if matching_anomaly else "N/A"
+        if matching_anomaly is None:
+            matching_anomaly = repo.get_latest_anomaly_for_metric(
+                tenant_id, source, metric_name, lower_bound, upper_bound
+            )
+        latest_metric = None
+        if matching_anomaly is None:
+            latest_metric = repo.get_latest_metric_for_source(
+                tenant_id, source, metric_name, upper_bound
+            )
+        observed_val = (
+            matching_anomaly["observed_value"] if matching_anomaly is not None
+            else latest_metric["value"] if latest_metric is not None
+            else "unavailable"
+        )
+        baseline = matching_anomaly["baseline_value"] if matching_anomaly is not None else None
+        thresholds = STATIC_THRESHOLDS.get(metric_name) or LOWER_IS_ANOMALOUS.get(metric_name)
+        threshold_text = (
+            ", ".join(f"{key}={value}" for key, value in thresholds.items())
+            if thresholds else "no configured static threshold"
+        )
+        evidence_reason = (
+            matching_anomaly["explanation"] if matching_anomaly is not None
+            else f"Latest persisted value for {metric_name} is {observed_val}; no anomaly explanation is available."
+        )
         template = RECOMMENDATION_TEMPLATES.get(
             metric_name,
             {
@@ -70,20 +110,29 @@ def generate_recommendations_for_incident(
         )
 
         # Formulate comprehensive 5-part explanation
+        baseline_text = str(baseline) if baseline is not None else "unavailable (insufficient prior history)"
         explanation = (
             f"1. What happened: Elevated telemetry detected on {source}. "
             f"2. Metric of concern: {metric_name}. "
             f"3. Observed value: {observed_val}. "
+            f"Baseline: {baseline_text}. Thresholds: {threshold_text}. "
+            f"Detection reason: {evidence_reason} "
             f"4. Why it matters: {template['why_it_matters']} "
             f"5. What operator should do: {template['suggested_action']}"
         )
+
+        title = f"[{source}] {template['title']}"
+        if repo.refresh_recommendation_for_incident_metric(
+            tenant_id, inc_id, title, explanation, template["suggested_action"], severity
+        ):
+            continue
 
         rec_id = f"rec-{uuid.uuid4()}"
         repo.save_recommendation(
             recommendation_id=rec_id,
             tenant_id=tenant_id,
             incident_id=inc_id,
-            title=f"[{source}] {template['title']}",
+            title=title,
             explanation=explanation,
             suggested_action=template["suggested_action"],
             severity=severity,
@@ -94,7 +143,7 @@ def generate_recommendations_for_incident(
             "recommendation_id": rec_id,
             "tenant_id": tenant_id,
             "incident_id": inc_id,
-            "title": f"[{source}] {template['title']}",
+            "title": title,
             "explanation": explanation,
             "suggested_action": template["suggested_action"],
             "severity": severity,

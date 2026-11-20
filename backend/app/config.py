@@ -28,3 +28,18 @@ PORT = int(os.getenv("PORT", "8000"))
 DEFAULT_DB_PATH = str(BASE_DIR / "saas_platform.db")
 _configured_db_path = Path(os.getenv("DATABASE_PATH", DEFAULT_DB_PATH))
 DATABASE_PATH = str(_configured_db_path if _configured_db_path.is_absolute() else PROJECT_ROOT / _configured_db_path)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+STALE_TELEMETRY_SECONDS = _positive_int_env("STALE_TELEMETRY_SECONDS", 120)
+ANOMALY_COOLDOWN_SECONDS = _positive_int_env("ANOMALY_COOLDOWN_SECONDS", 300)
+CORRELATION_WINDOW_SECONDS = _positive_int_env("CORRELATION_WINDOW_SECONDS", 600)

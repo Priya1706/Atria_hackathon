@@ -3,7 +3,9 @@ from datetime import datetime, timezone, timedelta
 import pytest
 from backend.app.db.repository import TelemetryRepository
 from backend.app.core.health_engine import calculate_source_health, calculate_tenant_health_summary
-from backend.app.core.anomaly_detection import detect_anomaly_for_metric
+from backend.app.core.anomaly_detection import detect_anomaly_for_metric, process_batch_anomalies
+from backend.app.core.incident_correlation import correlate_anomalies_to_incidents
+from backend.app.core.recommendation_engine import generate_recommendations_for_incident
 
 
 # ============================================================================
@@ -155,14 +157,16 @@ def test_health_evaluation_states(test_db_conn):
         timestamp=now,
         schema_version="1.0",
         metadata=None,
-        metrics=[{
-            "metric_id": str(uuid.uuid4()),
-            "source": "server-excellent",
-            "metric_name": "cpu_usage",
-            "value": 45.0,  # <= 70%
-            "unit": "percent",
-            "timestamp": now,
-        }],
+        metrics=[
+            {"metric_id": str(uuid.uuid4()), "source": "server-excellent", "metric_name": name,
+             "value": value, "unit": unit, "timestamp": now}
+            for name, value, unit in [
+                ("cpu_usage", 45.0, "percent"), ("memory_usage", 45.0, "percent"),
+                ("disk_usage", 45.0, "percent"), ("bandwidth_usage", 45.0, "percent"),
+                ("network_latency", 20.0, "ms"), ("packet_loss", 0.0, "percent"),
+                ("service_availability", 1.0, "ratio"), ("connectivity", 1.0, "ratio"),
+            ]
+        ],
     )
     h_exc = calculate_source_health("tenant-alpha", "server-excellent", repo)
     assert h_exc["health_status"] == "Excellent"
@@ -247,6 +251,39 @@ def test_missing_telemetry_source_health(test_db_conn):
     assert "no telemetry" in h_empty["explanation"].lower()
 
 
+def test_health_requires_complete_fresh_metrics_for_excellent(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    stale_iso = (now - timedelta(minutes=5)).isoformat()
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=now_iso, schema_version="1.0", metadata=None,
+        metrics=[
+            {"metric_id": str(uuid.uuid4()), "source": "partial", "metric_name": "cpu_usage",
+             "value": 30.0, "unit": "percent", "timestamp": now_iso},
+        ],
+    )
+    partial = calculate_source_health("tenant-alpha", "partial", repo, as_of_time=now)
+    assert partial["health_status"] == "Good"
+    assert "missing" in partial["explanation"].lower()
+
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=now_iso, schema_version="1.0", metadata=None,
+        metrics=[
+            {"metric_id": str(uuid.uuid4()), "source": "mixed-age", "metric_name": "cpu_usage",
+             "value": 30.0, "unit": "percent", "timestamp": now_iso},
+            {"metric_id": str(uuid.uuid4()), "source": "mixed-age", "metric_name": "network_latency",
+             "value": 10.0, "unit": "ms", "timestamp": stale_iso},
+        ],
+    )
+    mixed = calculate_source_health("tenant-alpha", "mixed-age", repo, as_of_time=now)
+    assert mixed["health_status"] == "Poor"
+    assert any(metric["metric_name"] == "network_latency" and metric["status"] == "Stale"
+               for metric in mixed["contributing_metrics"])
+
+
 # ============================================================================
 # 3. ANOMALY DETECTION & DUPLICATE SUPPRESSION
 # ============================================================================
@@ -285,6 +322,75 @@ def test_anomaly_detection_and_duplicate_suppression(test_db_conn):
         repo=repo,
     )
     assert anom2 is None  # Suppressed!
+
+
+def test_anomaly_baseline_excludes_current_and_same_batch_records(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    start = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+    history = [
+        {"metric_id": str(uuid.uuid4()), "source": "baseline-host", "metric_name": "cpu_usage",
+         "value": value, "unit": "percent", "timestamp": (start + timedelta(minutes=i)).isoformat()}
+        for i, value in enumerate((20.0, 30.0, 40.0))
+    ]
+    current_id = str(uuid.uuid4())
+    peer_id = str(uuid.uuid4())
+    incoming = [
+        {"metric_id": current_id, "source": "baseline-host", "metric_name": "cpu_usage",
+         "value": 86.0, "unit": "percent", "timestamp": (start + timedelta(minutes=4)).isoformat()},
+        {"metric_id": peer_id, "source": "baseline-host", "metric_name": "cpu_usage",
+         "value": 100.0, "unit": "percent", "timestamp": (start + timedelta(minutes=4)).isoformat()},
+    ]
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=(start + timedelta(minutes=4)).isoformat(), schema_version="1.0", metadata=None,
+        metrics=history + incoming,
+    )
+    anomalies = process_batch_anomalies("tenant-alpha", incoming, repo)
+    assert len(anomalies) == 2
+    assert all(anomaly["baseline_value"] == 30.0 for anomaly in anomalies)
+    assert all("3 readings" in anomaly["explanation"] for anomaly in anomalies)
+    assert all("sample standard deviation" in anomaly["explanation"] for anomaly in anomalies)
+
+
+def test_anomaly_out_of_order_reading_ignores_future_history(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    now = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+    future_metrics = [
+        {"metric_id": str(uuid.uuid4()), "source": "ordered-host", "metric_name": "cpu_usage",
+         "value": value, "unit": "percent", "timestamp": (now + timedelta(minutes=i)).isoformat()}
+        for i, value in enumerate((10.0, 20.0, 30.0), 1)
+    ]
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=(now + timedelta(minutes=3)).isoformat(), schema_version="1.0", metadata=None,
+        metrics=future_metrics,
+    )
+    anomaly = detect_anomaly_for_metric(
+        "tenant-alpha", "ordered-host", "cpu_usage", 86.0, str(uuid.uuid4()), now.isoformat(), repo,
+    )
+    assert anomaly is not None
+    assert anomaly["baseline_value"] is None
+    assert "warning threshold" in anomaly["explanation"]
+
+
+def test_repository_orders_offset_timestamps_by_instant(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp="2026-01-01T09:00:00Z", schema_version="1.0", metadata=None,
+        metrics=[
+            {"metric_id": str(uuid.uuid4()), "source": "offset-host", "metric_name": "cpu_usage",
+             "value": 50.0, "unit": "percent", "timestamp": "2026-01-01T09:00:00+02:00"},
+            {"metric_id": str(uuid.uuid4()), "source": "offset-host", "metric_name": "cpu_usage",
+             "value": 90.0, "unit": "percent", "timestamp": "2026-01-01T08:30:00Z"},
+        ],
+    )
+    history = repo.get_metric_history(
+        "tenant-alpha", "offset-host", "cpu_usage", before_timestamp="2026-01-01T08:00:00Z"
+    )
+    assert history == [50.0]
+    latest = repo.get_latest_metrics_per_source("tenant-alpha", "offset-host")
+    assert len(latest) == 1 and latest[0]["value"] == 90.0
 
 
 def test_normal_telemetry_triggers_no_anomalies(client, test_db_conn):
@@ -438,6 +544,81 @@ def test_duplicate_incident_prevention_on_continuous_telemetry(client, test_db_c
     assert len(worker_incidents) == 1
     # Related metrics must now include memory_usage
     assert "memory_usage" in worker_incidents[0]["related_metrics_json"]
+
+
+def test_incident_window_clusters_and_is_tenant_scoped(test_db_conn, monkeypatch):
+    import backend.app.core.incident_correlation as correlation
+
+    monkeypatch.setattr(correlation, "CORRELATION_WINDOW_SECONDS", 60)
+    repo = TelemetryRepository(test_db_conn)
+    start = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)
+
+    def anomaly(tenant, offset, metric="cpu_usage"):
+        return {"tenant_id": tenant, "source": "shared-name", "metric_name": metric,
+                "severity": "WARNING", "detected_at": (start + timedelta(seconds=offset)).isoformat()}
+
+    clustered = correlation.correlate_anomalies_to_incidents(
+        "tenant-alpha", [anomaly("tenant-alpha", 0), anomaly("tenant-alpha", 50, "memory_usage")], repo,
+    )
+    assert len(clustered) == 1
+    assert set(clustered[0]["related_metrics"]) == {"cpu_usage", "memory_usage"}
+    updated = correlation.correlate_anomalies_to_incidents(
+        "tenant-alpha", [anomaly("tenant-alpha", 55, "disk_usage")], repo,
+    )
+    assert len(updated) == 1 and updated[0]["incident_id"] == clustered[0]["incident_id"]
+    separated = correlation.correlate_anomalies_to_incidents(
+        "tenant-alpha", [anomaly("tenant-alpha", 120, "network_latency")], repo,
+    )
+    assert len(separated) == 1 and separated[0]["is_new"] is True
+    other_tenant = correlation.correlate_anomalies_to_incidents(
+        "tenant-beta", [anomaly("tenant-beta", 55)], repo,
+    )
+    assert other_tenant[0]["is_new"] is True
+    assert other_tenant[0]["incident_id"] != clustered[0]["incident_id"]
+
+
+def test_recommendations_use_persisted_evidence_and_deduplicate(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    detected_at = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    repo.save_anomaly(
+        anomaly_id="anomaly-recommendation-test", tenant_id="tenant-alpha", metric_id=None,
+        source="recommendation-host", metric_name="cpu_usage", observed_value=96.0,
+        baseline_value=62.5, severity="CRITICAL",
+        explanation="Observed 96.0 exceeds critical threshold 92.0 after a 3-sample baseline.",
+        detected_at=detected_at,
+    )
+    repo.save_anomaly(
+        anomaly_id="anomaly-after-incident", tenant_id="tenant-alpha", metric_id=None,
+        source="recommendation-host", metric_name="cpu_usage", observed_value=99.0,
+        baseline_value=70.0, severity="CRITICAL",
+        explanation="Later anomaly unrelated to the original incident.",
+        detected_at=datetime.now(timezone.utc).isoformat(),
+    )
+    incident_id = "incident-recommendation-test"
+    repo.create_incident(
+        incident_id=incident_id, tenant_id="tenant-alpha", affected_source="recommendation-host",
+        severity="CRITICAL", title="CPU issue", description="Test incident", status="OPEN",
+        detected_at=detected_at, related_metrics=["cpu_usage"],
+    )
+    incident = {"incident_id": incident_id, "affected_source": "recommendation-host",
+                "severity": "CRITICAL", "related_metrics": ["cpu_usage"],
+                "first_detected_at": detected_at, "last_updated_at": detected_at}
+    first = generate_recommendations_for_incident("tenant-alpha", incident, [], repo)
+    test_db_conn.execute(
+        "UPDATE recommendations SET explanation = '3. Observed value: N/A.' WHERE incident_id = ?",
+        (incident_id,),
+    )
+    test_db_conn.commit()
+    second = generate_recommendations_for_incident("tenant-alpha", incident, [], repo)
+    assert len(first) == 1
+    assert second == []
+    saved = repo.get_tenant_recommendations("tenant-alpha")[0]
+    explanation = saved["explanation"]
+    assert "N/A" not in explanation
+    assert "Observed value: 96.0" in explanation
+    assert "Baseline: 62.5" in explanation
+    assert "critical=92.0" in explanation
+    assert "exceeds critical threshold" in explanation
 
 
 # ============================================================================

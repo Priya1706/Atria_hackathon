@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from backend.app.db.repository import TelemetryRepository
+from backend.app.config import STALE_TELEMETRY_SECONDS
 
 # Documented Provisional Thresholds (Configurable)
 DEFAULT_METRIC_THRESHOLDS = {
@@ -20,7 +21,11 @@ LOWER_IS_BETTER = {
     "connectivity": {"excellent": 0.999, "good": 0.99, "fair": 0.5},
 }
 
-STALE_TELEMETRY_SECONDS = 120  # Telemetry older than 2 minutes is considered stale
+# These are the SaaS-normalized equivalents of collector.REQUIRED_HEALTH_METRICS.
+REQUIRED_HEALTH_METRICS = {
+    "cpu_usage", "memory_usage", "disk_usage", "bandwidth_usage",
+    "network_latency", "packet_loss", "service_availability", "connectivity",
+}
 
 
 def evaluate_metric_state(metric_name: str, value: float) -> Tuple[str, float, Optional[float]]:
@@ -84,50 +89,40 @@ def calculate_source_health(
             "evaluated_at": now_iso,
         }
 
-    # 2. Check for stale telemetry
-    most_recent_ts = None
-    for r in latest_records:
-        ts_str = r["timestamp"].replace("Z", "+00:00")
-        try:
-            ts = datetime.fromisoformat(ts_str)
-            if most_recent_ts is None or ts > most_recent_ts:
-                most_recent_ts = ts
-        except Exception:
-            pass
-
-    if most_recent_ts:
-        age_seconds = (now - most_recent_ts).total_seconds()
-        if age_seconds > STALE_TELEMETRY_SECONDS:
-            return {
-                "source": source,
-                "health_status": "Poor",
-                "health_score": 10.0,
-                "contributing_metrics": [
-                    {
-                        "metric_name": r["metric_name"],
-                        "observed_value": r["value"],
-                        "unit": r["unit"],
-                        "status": "Stale",
-                        "threshold": None,
-                    }
-                    for r in latest_records
-                ],
-                "explanation": f"Telemetry is stale. Last reading was received {int(age_seconds)}s ago (threshold: {STALE_TELEMETRY_SECONDS}s).",
-                "evaluated_at": now_iso,
-            }
-
-    # 3. Calculate health across all observed metrics
+    # 2. Evaluate freshness independently for every metric's latest reading.
+    # A fresh CPU sample cannot mask an old availability or latency sample.
     contributing_metrics = []
     has_poor = False
     has_fair = False
     has_good = False
     metric_scores = []
     explanations = []
+    stale_names = []
+    latest_names = {r["metric_name"] for r in latest_records}
+    missing_required = sorted(REQUIRED_HEALTH_METRICS - latest_names)
 
     for r in latest_records:
         name = r["metric_name"]
         val = r["value"]
         unit = r["unit"]
+        ts_text = r["timestamp"].replace("Z", "+00:00")
+        ts = datetime.fromisoformat(ts_text)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds())
+        if age_seconds > STALE_TELEMETRY_SECONDS:
+            stale_names.append(name)
+            contributing_metrics.append({
+                "metric_name": name,
+                "observed_value": val,
+                "unit": unit,
+                "status": "Stale",
+                "threshold": None,
+            })
+            explanations.append(
+                f"{name} is stale ({int(age_seconds)}s old; limit {STALE_TELEMETRY_SECONDS}s)"
+            )
+            continue
         state, score, threshold = evaluate_metric_state(name, val)
 
         metric_scores.append(score)
@@ -148,10 +143,16 @@ def calculate_source_health(
         elif state == "Good":
             has_good = True
 
-    # 4. Determine overall status and composite score
+    # 3. Determine overall status and composite score. Missing required signals
+    # cap health at Good; any observed stale signal is Poor because its current
+    # state is unknown. Four public health states remain unchanged.
     avg_score = sum(metric_scores) / len(metric_scores) if metric_scores else 50.0
 
-    if has_poor:
+    if stale_names:
+        overall_status = "Poor"
+        overall_score = 10.0
+        overall_explanation = f"Source health is critical: {'; '.join(explanations)}."
+    elif has_poor:
         overall_status = "Poor"
         overall_score = min(avg_score, 45.0)
         overall_explanation = f"Source health is critical: {'; '.join(explanations)}."
@@ -167,6 +168,15 @@ def calculate_source_health(
         overall_status = "Excellent"
         overall_score = max(avg_score, 92.0)
         overall_explanation = "All telemetry signals indicate optimal operating condition."
+
+    if missing_required:
+        if overall_status == "Excellent":
+            overall_status = "Good"
+            overall_score = min(overall_score, 88.0)
+        overall_explanation += (
+            f" Required health metrics missing: {', '.join(missing_required)}; "
+            "health is capped at Good until they are reported."
+        )
 
     # Persist evaluation
     eval_id = f"eval-{uuid.uuid4()}"

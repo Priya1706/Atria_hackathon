@@ -1,10 +1,17 @@
 import json
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from backend.app.config import CORRELATION_WINDOW_SECONDS
 from backend.app.db.repository import TelemetryRepository
 
-CORRELATION_WINDOW_SECONDS = 600  # 10-minute correlation window for related alerts
+
+def _utc_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def correlate_anomalies_to_incidents(
@@ -12,109 +19,99 @@ def correlate_anomalies_to_incidents(
     anomalies: List[Dict[str, Any]],
     repo: TelemetryRepository,
 ) -> List[Dict[str, Any]]:
-    """
-    Correlates detected anomalies into meaningful incidents:
-    - Clusters anomalies occurring on the same source within a rolling time window.
-    - Avoids duplicate open incidents by updating existing active incidents.
-    - Strictly frames causes as hypotheses, never asserting confirmed facts.
-    """
+    """Group same-source anomalies in bounded windows and update active incidents."""
     if not anomalies:
         return []
 
-    incidents_handled = []
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for anomaly in anomalies:
+        by_source.setdefault(anomaly["source"], []).append(anomaly)
 
-    # Group anomalies by source
-    anomalies_by_source: Dict[str, List[Dict[str, Any]]] = {}
-    for a in anomalies:
-        src = a["source"]
-        anomalies_by_source.setdefault(src, []).append(a)
+    handled: List[Dict[str, Any]] = []
+    for source, source_anomalies in by_source.items():
+        ordered = sorted(source_anomalies, key=lambda item: _utc_datetime(item["detected_at"]))
+        groups: List[List[Dict[str, Any]]] = []
+        for anomaly in ordered:
+            timestamp = _utc_datetime(anomaly["detected_at"])
+            if (not groups or timestamp - _utc_datetime(groups[-1][0]["detected_at"])
+                    > timedelta(seconds=CORRELATION_WINDOW_SECONDS)):
+                groups.append([anomaly])
+            else:
+                groups[-1].append(anomaly)
 
-    for source, source_anomalies in anomalies_by_source.items():
-        # Determine highest severity among new anomalies
-        has_critical = any(a["severity"] == "CRITICAL" for a in source_anomalies)
-        batch_severity = "CRITICAL" if has_critical else "WARNING"
+        for group in groups:
+            latest_dt = max(_utc_datetime(item["detected_at"]) for item in group)
+            latest_ts = latest_dt.isoformat()
+            window_start = (latest_dt - timedelta(seconds=CORRELATION_WINDOW_SECONDS)).isoformat()
+            names = sorted({item["metric_name"] for item in group})
+            severity = "CRITICAL" if any(item["severity"] == "CRITICAL" for item in group) else "WARNING"
+            existing = repo.find_active_incident(tenant_id, source, window_start, latest_ts)
 
-        new_metric_names = list({a["metric_name"] for a in source_anomalies})
-        latest_ts = max(a["detected_at"] for a in source_anomalies)
+            if existing:
+                incident_id = existing["incident_id"]
+                merged = sorted(set(json.loads(existing["related_metrics_json"]) + names))
+                severity = "CRITICAL" if existing["severity"] == "CRITICAL" or severity == "CRITICAL" else "WARNING"
+                last_updated = max(_utc_datetime(existing["last_updated_at"]), latest_dt).isoformat()
+                repo.update_incident(
+                    incident_id=incident_id,
+                    tenant_id=tenant_id,
+                    severity=severity,
+                    updated_at=last_updated,
+                    related_metrics=merged,
+                )
+                handled.append({
+                    "incident_id": incident_id,
+                    "tenant_id": tenant_id,
+                    "affected_source": source,
+                    "severity": severity,
+                    "title": existing["title"],
+                    "description": existing["description"],
+                    "status": existing["status"],
+                    "first_detected_at": existing["first_detected_at"],
+                    "last_updated_at": last_updated,
+                    "related_metrics": merged,
+                    "is_new": False,
+                })
+                continue
 
-        dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
-        window_start = (dt - timedelta(seconds=CORRELATION_WINDOW_SECONDS)).isoformat()
-
-        # Check if an active incident already exists for this tenant & source
-        existing = repo.find_active_incident(tenant_id, source, window_start)
-
-        if existing:
-            inc_id = existing["incident_id"]
-            existing_metrics = json.loads(existing["related_metrics_json"])
-            merged_metrics = list(set(existing_metrics + new_metric_names))
-
-            final_severity = "CRITICAL" if (existing["severity"] == "CRITICAL" or batch_severity == "CRITICAL") else "WARNING"
-
-            repo.update_incident(
-                incident_id=inc_id,
-                tenant_id=tenant_id,
-                severity=final_severity,
-                updated_at=latest_ts,
-                related_metrics=merged_metrics,
-            )
-
-            incidents_handled.append({
-                "incident_id": inc_id,
-                "tenant_id": tenant_id,
-                "affected_source": source,
-                "severity": final_severity,
-                "title": existing["title"],
-                "description": existing["description"],
-                "status": existing["status"],
-                "first_detected_at": existing["first_detected_at"],
-                "last_updated_at": latest_ts,
-                "related_metrics": merged_metrics,
-                "is_new": False,
-            })
-        else:
-            # Create a new incident
-            inc_id = f"inc-{uuid.uuid4()}"
-
-            # Formulate title and hypothesis-based description
-            if len(new_metric_names) > 1:
+            incident_id = f"inc-{uuid.uuid4()}"
+            if len(names) > 1:
                 title = f"Compound Performance Degradation on {source}"
                 description = (
-                    f"Correlated multi-signal anomaly detected across metrics: {', '.join(new_metric_names)}. "
-                    f"Possible cause (Hypothesis): Concurrent metric deviations suggest potential resource contention, "
-                    f"cascading request backlog, or underlying subsystem saturation."
+                    f"Correlated multi-signal anomaly detected across metrics: {', '.join(names)}. "
+                    "Possible cause (Hypothesis): Concurrent metric deviations suggest potential resource "
+                    "contention, cascading request backlog, or underlying subsystem saturation."
                 )
             else:
-                metric = new_metric_names[0]
-                title = f"Elevated {metric} on {source}"
+                name = names[0]
+                title = f"Elevated {name} on {source}"
                 description = (
-                    f"Abnormal telemetry observed for {metric}. "
-                    f"Possible cause (Hypothesis): Deviation exceeds baseline tolerance; potential service stress or background job overload."
+                    f"Abnormal telemetry observed for {name}. "
+                    "Possible cause (Hypothesis): Deviation exceeds baseline tolerance; potential service "
+                    "stress or background job overload."
                 )
-
             repo.create_incident(
-                incident_id=inc_id,
+                incident_id=incident_id,
                 tenant_id=tenant_id,
                 affected_source=source,
-                severity=batch_severity,
+                severity=severity,
                 title=title,
                 description=description,
                 status="OPEN",
                 detected_at=latest_ts,
-                related_metrics=new_metric_names,
+                related_metrics=names,
             )
-
-            incidents_handled.append({
-                "incident_id": inc_id,
+            handled.append({
+                "incident_id": incident_id,
                 "tenant_id": tenant_id,
                 "affected_source": source,
-                "severity": batch_severity,
+                "severity": severity,
                 "title": title,
                 "description": description,
                 "status": "OPEN",
                 "first_detected_at": latest_ts,
                 "last_updated_at": latest_ts,
-                "related_metrics": new_metric_names,
+                "related_metrics": names,
                 "is_new": True,
             })
-
-    return incidents_handled
+    return handled
