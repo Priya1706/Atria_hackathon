@@ -1,0 +1,25 @@
+# Python runtime & environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Databases & State
+*.db
+*.sqlite3
+saas_platform.db
+
+# Secrets & Environment variables
+.env
+*.local
+
+# IDE & Editor files
+.vscode/
+.idea/
