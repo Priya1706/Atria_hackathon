@@ -6,6 +6,7 @@ from backend.app.core.anomaly_detection import process_batch_anomalies
 from backend.app.core.auth import CollectorAuthContext
 from backend.app.core.health_engine import calculate_source_health
 from backend.app.core.incident_correlation import correlate_anomalies_to_incidents
+from backend.app.core.incident_recovery import evaluate_source_incident_recovery
 from backend.app.core.recommendation_engine import generate_recommendations_for_incident
 from backend.app.db.repository import TelemetryRepository
 from backend.app.schemas.telemetry import TelemetryIngestRequest
@@ -119,6 +120,12 @@ def process_telemetry_batch(
         calculate_source_health(
             tenant_id=auth.tenant_id,
             source=src,
+            repo=repo,
+        )
+        evaluate_source_incident_recovery(
+            tenant_id=auth.tenant_id,
+            source=src,
+            incoming_metrics=metrics_data,
             repo=repo,
         )
 

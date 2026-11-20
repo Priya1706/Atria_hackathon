@@ -1,4 +1,5 @@
 import uuid
+import time
 from datetime import datetime, timezone, timedelta
 import pytest
 from backend.app.db.repository import TelemetryRepository
@@ -6,6 +7,7 @@ from backend.app.core.health_engine import calculate_source_health, calculate_te
 from backend.app.core.anomaly_detection import detect_anomaly_for_metric, process_batch_anomalies
 from backend.app.core.incident_correlation import correlate_anomalies_to_incidents
 from backend.app.core.recommendation_engine import generate_recommendations_for_incident
+from backend.app.core.incident_recovery import evaluate_source_incident_recovery
 
 
 # ============================================================================
@@ -309,6 +311,7 @@ def test_anomaly_detection_and_duplicate_suppression(test_db_conn):
     assert anom1 is not None
     assert anom1["severity"] == "CRITICAL"
     assert "critically high" in anom1["explanation"]
+    assert "baseline unavailable" in anom1["explanation"]
 
     # 2. Second reading 10 seconds later with same value must be suppressed
     later_time = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
@@ -348,8 +351,8 @@ def test_anomaly_baseline_excludes_current_and_same_batch_records(test_db_conn):
     anomalies = process_batch_anomalies("tenant-alpha", incoming, repo)
     assert len(anomalies) == 2
     assert all(anomaly["baseline_value"] == 30.0 for anomaly in anomalies)
-    assert all("3 readings" in anomaly["explanation"] for anomaly in anomalies)
-    assert all("sample standard deviation" in anomaly["explanation"] for anomaly in anomalies)
+    assert all("sample_count=3" in anomaly["explanation"] for anomaly in anomalies)
+    assert all("robust_sigma=" in anomaly["explanation"] for anomaly in anomalies)
 
 
 def test_anomaly_out_of_order_reading_ignores_future_history(test_db_conn):
@@ -391,6 +394,94 @@ def test_repository_orders_offset_timestamps_by_instant(test_db_conn):
     assert history == [50.0]
     latest = repo.get_latest_metrics_per_source("tenant-alpha", "offset-host")
     assert len(latest) == 1 and latest[0]["value"] == 90.0
+
+
+def test_median_mad_baseline_resists_historic_outlier(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    end = datetime.now(timezone.utc)
+    history = [10.0, 10.0, 10.0, 10.0, 1000.0]
+    metrics = [
+        {"metric_id": str(uuid.uuid4()), "source": "robust-host", "metric_name": "custom_signal",
+         "value": value, "unit": "count", "timestamp": (end - timedelta(minutes=len(history) - i)).isoformat()}
+        for i, value in enumerate(history)
+    ]
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=end.isoformat(), schema_version="1.0", metadata=None, metrics=metrics,
+    )
+    anomaly = detect_anomaly_for_metric(
+        "tenant-alpha", "robust-host", "custom_signal", 100.0, str(uuid.uuid4()), end.isoformat(), repo,
+    )
+    assert anomaly is not None
+    assert anomaly["baseline_value"] == 10.0
+    assert "MAD=0.00" in anomaly["explanation"]
+    assert "robust deviation rule" in anomaly["explanation"]
+
+
+def test_rolling_baseline_ignores_samples_outside_configured_window(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    now = datetime.now(timezone.utc)
+    values = [(999.0, now - timedelta(hours=2))]
+    values.extend((value, now - timedelta(minutes=3 - index)) for index, value in enumerate((40.0, 50.0, 60.0)))
+    metrics = [
+        {"metric_id": str(uuid.uuid4()), "source": "window-host", "metric_name": "custom_signal",
+         "value": value, "unit": "units", "timestamp": timestamp.isoformat()}
+        for value, timestamp in values
+    ]
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=now.isoformat(), schema_version="1.0", metadata=None, metrics=metrics,
+    )
+    anomaly = detect_anomaly_for_metric(
+        "tenant-alpha", "window-host", "custom_signal", 100.0, str(uuid.uuid4()), now.isoformat(), repo,
+    )
+    assert anomaly is not None
+    assert anomaly["baseline_value"] == 50.0
+    assert "sample_count=3" in anomaly["explanation"]
+
+
+def test_gradual_rise_is_detected_without_static_threshold(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    end = datetime.now(timezone.utc)
+    history = [50.0, 50.0, 50.0, 60.0, 61.0, 62.0]
+    metrics = [
+        {"metric_id": str(uuid.uuid4()), "source": "trend-host", "metric_name": "custom_signal",
+         "value": value, "unit": "count", "timestamp": (end - timedelta(minutes=len(history) - i)).isoformat()}
+        for i, value in enumerate(history)
+    ]
+    repo.save_batch(
+        batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+        timestamp=end.isoformat(), schema_version="1.0", metadata=None, metrics=metrics,
+    )
+    anomaly = detect_anomaly_for_metric(
+        "tenant-alpha", "trend-host", "custom_signal", 63.0, str(uuid.uuid4()), end.isoformat(), repo,
+    )
+    assert anomaly is not None
+    assert anomaly["severity"] == "WARNING"
+    assert "monotonic gradual-rise rule" in anomaly["explanation"]
+
+
+def test_synthetic_evaluation_regresses_prior_cooldown_false_negatives():
+    """The same labeled sequence should recognize qualifying trend continuations."""
+    from backend.evaluate_aiops import evaluate
+
+    result = evaluate()
+    assert result["samples"] == 34
+    assert result["original"]["confusion_counts"] == {
+        "tp": 2, "fp": 0, "tn": 29, "fn": 3,
+    }
+    assert [sample["index"] for sample in result["original"]["false_negative_samples"]] == [31, 32, 33]
+    # Labels are unchanged. The trend continuation rule catches the last two
+    # rising samples without increasing false positives; index 31 remains under
+    # cooldown because it immediately follows the first alert at index 30.
+    assert result["improved"]["confusion_counts"] == {
+        "tp": 4, "fp": 0, "tn": 29, "fn": 1,
+    }
+    assert [sample["index"] for sample in result["improved"]["false_negative_samples"]] == [31]
+    assert result["improved"]["precision"] == 1.0
+    assert result["improved"]["recall"] == 0.8
+    assert result["improved"]["f1"] == 0.8889
+    assert result["improved"]["false_positive_rate"] == 0.0
 
 
 def test_normal_telemetry_triggers_no_anomalies(client, test_db_conn):
@@ -454,6 +545,14 @@ def test_incident_correlation_pipeline(client, test_db_conn):
                 "unit": "ms",
                 "timestamp": now,
             },
+            {
+                "metric_id": str(uuid.uuid4()),
+                "source": "api-gateway",
+                "metric_name": "memory_usage",
+                "value": 97.0,
+                "unit": "percent",
+                "timestamp": now,
+            },
         ],
     }
 
@@ -475,6 +574,21 @@ def test_incident_correlation_pipeline(client, test_db_conn):
     assert inc["status"] == "OPEN"
     assert "Hypothesis" in inc["description"]
 
+    incident_response = client.get("/api/v1/incidents", headers={"X-Tenant-ID": "tenant-alpha"})
+    assert incident_response.status_code == 200
+    api_incident = next(item for item in incident_response.json() if item["incident_id"] == inc["incident_id"])
+    assert {item["metric_name"] for item in api_incident["contributing_metrics"]} == {
+        "cpu_usage", "memory_usage", "network_latency",
+    }
+    resource_hypothesis = next(
+        item for item in api_incident["root_cause_hypotheses"]
+        if item["rule"] == "resource_saturation"
+    )
+    assert resource_hypothesis["evidence_strength"] >= 75
+    assert "not a probability" in resource_hypothesis["score_meaning"]
+    assert "not proof of causation" in api_incident["contextual_summary"]
+    assert client.get("/api/v1/incidents", headers={"X-Tenant-ID": "tenant-beta"}).json() == []
+
     # Verify recommendations were generated answering the 5 questions
     recs = repo.get_tenant_recommendations("tenant-alpha")
     assert len(recs) >= 1
@@ -484,6 +598,10 @@ def test_incident_correlation_pipeline(client, test_db_conn):
     assert "3. Observed value:" in rec["explanation"]
     assert "4. Why it matters:" in rec["explanation"]
     assert "5. What operator should do:" in rec["explanation"]
+    assert "Expected outcome:" in rec["explanation"]
+    assert "Evidence strength:" in rec["explanation"]
+    assert "Risks/prerequisites:" in rec["explanation"]
+    assert "Verification:" in rec["explanation"]
 
 
 def test_duplicate_incident_prevention_on_continuous_telemetry(client, test_db_conn):
@@ -621,6 +739,70 @@ def test_recommendations_use_persisted_evidence_and_deduplicate(test_db_conn):
     assert "exceeds critical threshold" in explanation
 
 
+def test_recovery_waits_for_all_metrics_and_resets_on_regression(test_db_conn):
+    repo = TelemetryRepository(test_db_conn)
+    incident_time = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    repo.create_incident(
+        incident_id="incident-recovery-test", tenant_id="tenant-alpha", affected_source="recovery-host",
+        severity="CRITICAL", title="Compound issue", description="Test", status="OPEN",
+        detected_at=incident_time.isoformat(), related_metrics=["cpu_usage", "memory_usage"],
+    )
+
+    def save_and_evaluate(at, values):
+        timestamp = at.isoformat()
+        metrics = [
+            {"metric_id": str(uuid.uuid4()), "source": "recovery-host", "metric_name": name,
+             "value": value, "unit": "percent", "timestamp": timestamp}
+            for name, value in values.items()
+        ]
+        repo.save_batch(
+            batch_id=str(uuid.uuid4()), tenant_id="tenant-alpha", collector_id="collector-001",
+            timestamp=timestamp, schema_version="1.0", metadata=None, metrics=metrics,
+        )
+        return evaluate_source_incident_recovery(
+            "tenant-alpha", "recovery-host", metrics, repo, as_of_time=at
+        )
+
+    save_and_evaluate(incident_time + timedelta(seconds=10), {"cpu_usage": 50.0})
+    current = repo.get_incident_by_id("incident-recovery-test", "tenant-alpha")
+    assert current["lifecycle_stage"] == "DETECTED"
+    save_and_evaluate(incident_time + timedelta(seconds=20), {"cpu_usage": 50.0, "memory_usage": 50.0})
+    current = repo.get_incident_by_id("incident-recovery-test", "tenant-alpha")
+    assert current["lifecycle_stage"] == "RECOVERING"
+
+    save_and_evaluate(incident_time + timedelta(seconds=100), {"cpu_usage": 96.0, "memory_usage": 50.0})
+    current = repo.get_incident_by_id("incident-recovery-test", "tenant-alpha")
+    assert current["lifecycle_stage"] == "INVESTIGATING"
+    assert current["recovery_since"] is None
+
+    save_and_evaluate(incident_time + timedelta(seconds=200), {"cpu_usage": 50.0, "memory_usage": 50.0})
+    save_and_evaluate(incident_time + timedelta(seconds=300), {"cpu_usage": 50.0, "memory_usage": 50.0})
+    save_and_evaluate(incident_time + timedelta(seconds=400), {"cpu_usage": 50.0, "memory_usage": 50.0})
+    resolved = save_and_evaluate(
+        incident_time + timedelta(seconds=500), {"cpu_usage": 50.0, "memory_usage": 50.0}
+    )
+    current = repo.get_incident_by_id("incident-recovery-test", "tenant-alpha")
+    assert resolved == ["incident-recovery-test"]
+    assert current["status"] == "RESOLVED"
+    assert current["lifecycle_stage"] == "RESOLVED"
+    assert [event["to_stage"] for event in repo.get_incident_lifecycle_events(
+        "tenant-alpha", "incident-recovery-test"
+    )] == ["DETECTED", "RECOVERING", "INVESTIGATING", "RECOVERING", "RESOLVED"]
+
+
+def test_aiops_window_configuration_defaults_and_validation(monkeypatch):
+    import backend.app.config as config
+
+    assert config.ANOMALY_BASELINE_WINDOW_SECONDS > 0
+    assert config.INCIDENT_RECOVERY_WINDOW_SECONDS > 0
+    monkeypatch.delenv("TEST_WINDOW_SECONDS", raising=False)
+    assert config._positive_int_env("TEST_WINDOW_SECONDS", 123) == 123
+    for invalid in ("0", "-5", "invalid"):
+        monkeypatch.setenv("TEST_WINDOW_SECONDS", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            config._positive_int_env("TEST_WINDOW_SECONDS", 123)
+
+
 # ============================================================================
 # 5. FRONTEND / DASHBOARD APIS & TENANT ISOLATION
 # ============================================================================
@@ -707,7 +889,7 @@ def test_dashboard_overview_and_tenant_isolation(client, test_db_conn):
         assert "beta" not in anom["source"]
 
 
-def test_incident_status_lifecycle_patch(client, test_db_conn):
+def test_incident_status_lifecycle_patch(client, test_db_conn, monkeypatch):
     """
     Tests PATCH /api/v1/incidents/{incident_id}
     OPEN -> ACKNOWLEDGED -> RESOLVED
@@ -746,7 +928,44 @@ def test_incident_status_lifecycle_patch(client, test_db_conn):
     assert res_ack.status_code == 200
     assert res_ack.json()["status"] == "ACKNOWLEDGED"
 
-    # 2. Resolve incident
+    # 2. Operator resolution is rejected before verified recovery.
+    res_early = client.patch(
+        f"/api/v1/incidents/{incident_id}",
+        json={"status": "RESOLVED"},
+        headers={"X-Tenant-ID": "tenant-alpha"},
+    )
+    assert res_early.status_code == 409
+
+    # Two healthy CPU samples spanning the configured recovery window resolve it.
+    import backend.app.core.incident_recovery as recovery_module
+
+    monkeypatch.setattr(recovery_module, "INCIDENT_RECOVERY_WINDOW_SECONDS", 0.1)
+    recovery_start = datetime.fromisoformat(now) + timedelta(seconds=0.05)
+    recovery_end = recovery_start + timedelta(seconds=0.3)
+    for index, batch_time in enumerate((recovery_start, recovery_end)):
+        if index:
+            time.sleep(0.5)
+        recovery_time = batch_time.isoformat()
+        recovery_response = client.post(
+            "/api/v1/ingest/telemetry",
+            json={
+                "batch_id": str(uuid.uuid4()), "collector_id": "collector-001",
+                "timestamp": recovery_time,
+                "metrics": [{"metric_id": str(uuid.uuid4()), "source": "database-cluster",
+                             "metric_name": "cpu_usage", "value": 55.0, "unit": "percent",
+                             "timestamp": recovery_time}],
+            },
+            headers={"X-API-Key": "key-alpha-valid-1234"},
+        )
+        assert recovery_response.status_code == 200
+
+    lifecycle = client.get("/api/v1/incidents", headers={"X-Tenant-ID": "tenant-alpha"}).json()
+    recovered = next(item for item in lifecycle if item["incident_id"] == incident_id)
+    assert recovered["status"] == "RESOLVED", recovered
+    assert recovered["lifecycle_stage"] == "RESOLVED"
+    assert any(event["to_stage"] == "RECOVERING" for event in recovered["lifecycle_events"])
+
+    # 3. The API remains compatible with the existing status enum after recovery.
     res_res = client.patch(
         f"/api/v1/incidents/{incident_id}",
         json={"status": "RESOLVED"},
@@ -754,8 +973,9 @@ def test_incident_status_lifecycle_patch(client, test_db_conn):
     )
     assert res_res.status_code == 200
     assert res_res.json()["status"] == "RESOLVED"
+    assert res_res.json()["recovery_since"] is not None
 
-    # 3. Cross-tenant attempt to patch Alpha's incident with Beta's header must fail with 404
+    # 4. Cross-tenant attempt to patch Alpha's incident with Beta's header must fail with 404
     res_cross = client.patch(
         f"/api/v1/incidents/{incident_id}",
         json={"status": "OPEN"},

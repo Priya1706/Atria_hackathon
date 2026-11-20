@@ -74,9 +74,9 @@ SaaS: `GET /health`; `POST /api/v1/ingest/telemetry`; dashboard, health, telemet
 ## Tests
 
 ```powershell
-python -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-This runs collector unit tests, SaaS tests, metric compatibility tests, development provisioning tests, and a mocked in-process end-to-end collector-to-SaaS test. The integration test simulates a lost first acknowledgement, retries the identical body, validates the SaaS duplicate acknowledgement, and verifies tenant assignment, persistence, anomalies, and health processing.
+This runs collector and SaaS unit tests, metric compatibility and provisioning tests, in-process retry/idempotency coverage, and a real loopback HTTP integration test. The loopback test exercises the production collector transport against the SaaS app, including privacy filtering, tenant isolation, incident recommendations, recovery, and retry after a SaaS restart.
 
 More details: [docs/architecture.md](docs/architecture.md), [docs/demo-guide.md](docs/demo-guide.md), and [backend/README.md](backend/README.md).

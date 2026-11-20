@@ -132,8 +132,9 @@ def transmit():
 
 
 @app.post("/collector/demo", response_model=CollectResponse)
-def demo():
-    samples = sample_events()
+def demo(scenario: str = Query("normal", pattern="^(normal|sudden_cpu|compound|recovery)$")):
+    """Runs explicit synthetic scenarios through the normal collector pipeline."""
+    samples = sample_events(scenario)
     if not samples:
         raise HTTPException(status_code=409, detail="simulator is disabled")
     ids, found, health_result, batch_id = pipeline.accept([TelemetryInput(**e) for e in samples])

@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 class TelemetryRepository:
@@ -183,6 +183,7 @@ class TelemetryRepository:
         self, tenant_id: str, source: str, metric_name: str, limit: int = 20,
         before_timestamp: Optional[str] = None,
         exclude_metric_ids: Optional[List[str]] = None,
+        since_timestamp: Optional[str] = None,
     ) -> List[float]:
         """Fetches strictly earlier values, optionally excluding an entire incoming batch."""
         cursor = self.conn.cursor()
@@ -192,6 +193,9 @@ class TelemetryRepository:
         if before_timestamp is not None:
             query += " AND julianday(timestamp) < julianday(?)"
             params.append(before_timestamp)
+        if since_timestamp is not None:
+            query += " AND julianday(timestamp) >= julianday(?)"
+            params.append(since_timestamp)
         if exclude_metric_ids:
             placeholders = ",".join("?" for _ in exclude_metric_ids)
             query += f" AND metric_id NOT IN ({placeholders})"
@@ -212,24 +216,80 @@ class TelemetryRepository:
         )
         return [r["source"] for r in cursor.fetchall()]
 
-    def get_latest_metrics_per_source(self, tenant_id: str, source: str) -> List[sqlite3.Row]:
+    def get_latest_metrics_per_source(
+        self, tenant_id: str, source: str, from_timestamp: Optional[str] = None,
+        through_timestamp: Optional[str] = None,
+    ) -> List[sqlite3.Row]:
         """Gets the most recent reading for each metric name for a given source."""
         cursor = self.conn.cursor()
+        bounds = ""
+        params: List[Any] = [tenant_id, source]
+        if from_timestamp is not None:
+            bounds += " AND julianday(t1.timestamp) >= julianday(?)"
+            params.append(from_timestamp)
+        if through_timestamp is not None:
+            bounds += " AND julianday(t1.timestamp) <= julianday(?)"
+            params.append(through_timestamp)
+        newer_bounds = ""
+        if from_timestamp is not None:
+            newer_bounds += " AND julianday(t2.timestamp) >= julianday(?)"
+            params.append(from_timestamp)
+        if through_timestamp is not None:
+            newer_bounds += " AND julianday(t2.timestamp) <= julianday(?)"
+            params.append(through_timestamp)
         cursor.execute(
-            """
+            f"""
             SELECT t1.*
             FROM telemetry_records t1
             WHERE t1.tenant_id = ? AND t1.source = ?
+              {bounds}
               AND NOT EXISTS (
                 SELECT 1 FROM telemetry_records t2
                 WHERE t2.tenant_id = t1.tenant_id AND t2.source = t1.source
                   AND t2.metric_name = t1.metric_name
+                  {newer_bounds}
                   AND (julianday(t2.timestamp) > julianday(t1.timestamp)
                        OR (julianday(t2.timestamp) = julianday(t1.timestamp)
                            AND t2.metric_id > t1.metric_id))
               )
             """,
-            (tenant_id, source),
+            tuple(params),
+        )
+        return cursor.fetchall()
+
+    def get_metric_readings(
+        self, tenant_id: str, source: str, metric_names: List[str],
+        from_timestamp: str, through_timestamp: str,
+    ) -> List[sqlite3.Row]:
+        if not metric_names:
+            return []
+        placeholders = ",".join("?" for _ in metric_names)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"""SELECT metric_name, value, unit, timestamp FROM telemetry_records
+                WHERE tenant_id = ? AND source = ? AND metric_name IN ({placeholders})
+                  AND julianday(timestamp) >= julianday(?)
+                  AND julianday(timestamp) <= julianday(?)
+                ORDER BY metric_name, julianday(timestamp), metric_id""",
+            (tenant_id, source, *metric_names, from_timestamp, through_timestamp),
+        )
+        return cursor.fetchall()
+
+    def get_incident_anomalies(
+        self, tenant_id: str, source: str, metric_names: List[str],
+        from_timestamp: str, through_timestamp: str,
+    ) -> List[sqlite3.Row]:
+        if not metric_names:
+            return []
+        placeholders = ",".join("?" for _ in metric_names)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"""SELECT * FROM anomalies WHERE tenant_id = ? AND source = ?
+                AND metric_name IN ({placeholders})
+                AND julianday(detected_at) >= julianday(?)
+                AND julianday(detected_at) <= julianday(?)
+                ORDER BY julianday(detected_at), anomaly_id""",
+            (tenant_id, source, *metric_names, from_timestamp, through_timestamp),
         )
         return cursor.fetchall()
 
@@ -368,6 +428,12 @@ class TelemetryRepository:
                 json.dumps(related_metrics),
             ),
         )
+        cursor.execute(
+            """INSERT INTO incident_lifecycle_events
+               (event_id, incident_id, tenant_id, from_stage, to_stage, changed_at, reason)
+               VALUES (?, ?, ?, NULL, 'DETECTED', ?, ?)""",
+            (str(uuid4()), incident_id, tenant_id, detected_at, "Incident created from telemetry anomalies."),
+        )
         self.conn.commit()
 
     def update_incident(
@@ -392,16 +458,67 @@ class TelemetryRepository:
 
     def set_incident_status(self, incident_id: str, tenant_id: str, status: str) -> bool:
         cursor = self.conn.cursor()
+        current = self.get_incident_by_id(incident_id, tenant_id)
+        if current is None or (status == "RESOLVED" and current["lifecycle_stage"] != "RESOLVED"):
+            return False
+        at = datetime.now(timezone.utc).isoformat()
+        stage = "INVESTIGATING" if status == "ACKNOWLEDGED" else "DETECTED" if status == "OPEN" else "RESOLVED"
         cursor.execute(
-            """
-            UPDATE incidents
-            SET status = ?, last_updated_at = ?
-            WHERE incident_id = ? AND tenant_id = ?
-            """,
-            (status, datetime.now(timezone.utc).isoformat(), incident_id, tenant_id),
+            "UPDATE incidents SET status = ?, last_updated_at = ?, lifecycle_stage = ?, recovery_since = CASE WHEN ? = 'RESOLVED' THEN recovery_since ELSE NULL END WHERE incident_id = ? AND tenant_id = ?",
+            (status, at, stage, status, incident_id, tenant_id),
         )
+        if current["lifecycle_stage"] != stage:
+            cursor.execute(
+                """INSERT INTO incident_lifecycle_events
+                   (event_id, incident_id, tenant_id, from_stage, to_stage, changed_at, reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid4()), incident_id, tenant_id, current["lifecycle_stage"], stage, at,
+                 f"Incident status changed to {status}."),
+            )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def get_active_incidents_for_source(self, tenant_id: str, source: str) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """SELECT * FROM incidents WHERE tenant_id = ? AND affected_source = ?
+               AND status IN ('OPEN', 'ACKNOWLEDGED') ORDER BY julianday(last_updated_at)""",
+            (tenant_id, source),
+        )
+        return cursor.fetchall()
+
+    def set_incident_lifecycle(
+        self, incident_id: str, tenant_id: str, stage: str, recovery_since: Optional[str],
+        changed_at: str, reason: str, status: Optional[str] = None,
+    ) -> bool:
+        cursor = self.conn.cursor()
+        current = self.get_incident_by_id(incident_id, tenant_id)
+        if current is None:
+            return False
+        new_status = status or current["status"]
+        cursor.execute(
+            """UPDATE incidents SET lifecycle_stage = ?, recovery_since = ?, status = ?
+               WHERE incident_id = ? AND tenant_id = ?""",
+            (stage, recovery_since, new_status, incident_id, tenant_id),
+        )
+        if current["lifecycle_stage"] != stage:
+            cursor.execute(
+                """INSERT INTO incident_lifecycle_events
+                   (event_id, incident_id, tenant_id, from_stage, to_stage, changed_at, reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid4()), incident_id, tenant_id, current["lifecycle_stage"], stage, changed_at, reason),
+            )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_incident_lifecycle_events(self, tenant_id: str, incident_id: str) -> List[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """SELECT * FROM incident_lifecycle_events WHERE tenant_id = ? AND incident_id = ?
+               ORDER BY julianday(changed_at), event_id""",
+            (tenant_id, incident_id),
+        )
+        return cursor.fetchall()
 
     def get_incident_by_id(self, incident_id: str, tenant_id: str) -> Optional[sqlite3.Row]:
         cursor = self.conn.cursor()

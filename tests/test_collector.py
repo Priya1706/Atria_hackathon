@@ -16,6 +16,7 @@ from collector.pipeline import Pipeline, REQUIRED_HEALTH_METRICS
 from collector.saas_contract import APPROVED_METRIC_FIELDS
 from collector.store import Store
 import collector.pipeline as pipeline_module
+import collector.simulator as simulator_module
 import collector.transport as transport
 
 
@@ -243,7 +244,9 @@ def test_background_retry_worker_executes_while_api_is_running(tmp_path, monkeyp
 
 def test_api_error_handling_collect_status_and_egress_routes(tmp_path, monkeypatch):
     pipeline_settings(monkeypatch)
-    monkeypatch.setattr(app_module, "settings", SimpleNamespace(tenant_id="demo-tenant", collector_id="collector-001", simulator_enabled=True, saas_url="", saas_api_key=""))
+    demo_settings = SimpleNamespace(tenant_id="demo-tenant", collector_id="collector-001", simulator_enabled=True, saas_url="", saas_api_key="")
+    monkeypatch.setattr(app_module, "settings", demo_settings)
+    monkeypatch.setattr(simulator_module, "settings", demo_settings)
     monkeypatch.setattr(app_module, "store", Store(str(tmp_path / "api.db")))
     monkeypatch.setattr(app_module, "pipeline", Pipeline(app_module.store))
     client = TestClient(app_module.app)
@@ -257,6 +260,16 @@ def test_api_error_handling_collect_status_and_egress_routes(tmp_path, monkeypat
     assert detail.status_code == 200 and detail.json()["batch_id"] == batch_id
     assert isinstance(detail.json()["fields_removed"], list)
     assert client.get("/collector/egress/unknown").status_code == 404
+    demo = client.post("/collector/demo?scenario=compound")
+    assert demo.status_code == 200 and demo.json()["accepted"] == 10
+    compound_batch = app_module.store.get_egress(demo.json()["batch_id"])
+    compound_payload = json.loads(compound_batch["payload_json"])
+    values = {item["metric_name"]: item["value"] for item in compound_payload["metrics"]}
+    assert values["cpu_usage"] == 98.0
+    assert values["memory_usage"] == 97.0
+    assert values["network_latency"] == 550.0
+    assert "password" not in compound_batch["payload_json"]
+    assert client.post("/collector/demo?scenario=unrecognized").status_code == 422
     payload["tenant_id"] = "other-tenant"
     assert client.post("/collector/collect", json={"events": [payload]}).status_code == 403
     payload["tenant_id"] = "demo-tenant"

@@ -63,6 +63,71 @@ Dashboard APIs use `X-Tenant-ID`; the telemetry ingestion endpoint instead authe
 
 The automated E2E test simulates SaaS accepting a batch but the response being lost. The collector retries identical audited JSON; SaaS answers 409 `status: duplicate`; collector marks the matching batch `sent`. A separate case reuses a metric UUID in a new batch, receives 409 `status: error`, and remains failed. No live SaaS server is required for that test.
 
+## Staged statistical AIOps demonstration
+
+The simulator's named scenarios are sent through the real collector pipeline,
+the normal privacy/egress allow-list, collector transport, SaaS authentication,
+telemetry persistence, anomaly detection, incident correlation and recommendation
+routes. Values are synthetic demonstration inputs, not production or organizer data.
+
+Run the scenarios in order and ensure each batch is delivered before continuing:
+
+```powershell
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=normal'
+Start-Sleep -Seconds 2
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/transmit
+
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=sudden_cpu'
+Start-Sleep -Seconds 2
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/transmit
+
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=compound'
+Start-Sleep -Seconds 2
+Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/transmit
+```
+
+Inspect incidents and recommendations using the provisioned tenant:
+
+```powershell
+$headers = @{ 'X-Tenant-ID' = '<tenant id from provisioning>' }
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/incidents -Headers $headers | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/recommendations -Headers $headers | ConvertTo-Json -Depth 10
+```
+
+Incident responses include contributing metric evidence and ranked,
+rule-weighted hypotheses. Evidence scores are deterministic heuristics, not
+probabilities or confirmed causes. Recovery requires every contributing metric
+to remain inside its recovery range for the configured window (five minutes by
+default), with at least two observations per metric and a fresh final sample.
+To demonstrate this, transmit the recovery scenario once per minute for five
+minutes, including the initial sample that establishes recovery:
+
+```powershell
+for ($i = 0; $i -lt 6; $i++) {
+    Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=recovery'
+    Start-Sleep -Seconds 2
+    Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/transmit
+    if ($i -lt 5) { Start-Sleep -Seconds 60 }
+}
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/incidents -Headers $headers | ConvertTo-Json -Depth 10
+```
+
+Only incident state changes automatically; the system does not execute
+remediation. Adjust `INCIDENT_RECOVERY_WINDOW_SECONDS` in local `.env` only for
+a shorter demo and disclose that setting.
+
+## Synthetic detector evaluation
+
+Run the deterministic offline dataset without external services or credentials:
+
+```powershell
+python -m backend.evaluate_aiops
+```
+
+It prints the dataset description, scenario-label assumptions, confusion
+counts, precision, recall, F1 and false-positive rate. Results describe only
+that small synthetic sequence, not production detector performance.
+
 Run the full suite:
 
 ```powershell

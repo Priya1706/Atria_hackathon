@@ -59,6 +59,12 @@ def correlate_anomalies_to_incidents(
                     updated_at=last_updated,
                     related_metrics=merged,
                 )
+                if existing["lifecycle_stage"] == "RECOVERING":
+                    repo.set_incident_lifecycle(
+                        incident_id, tenant_id, "INVESTIGATING", None, latest_ts,
+                        "A new anomaly occurred during recovery; the recovery window was reset.",
+                        status=existing["status"],
+                    )
                 handled.append({
                     "incident_id": incident_id,
                     "tenant_id": tenant_id,

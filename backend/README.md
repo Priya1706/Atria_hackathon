@@ -318,12 +318,12 @@ X-API-Key: key-alpha-valid-1234
 
 ## 9. Automated Testing
 
-Run the test suite using pytest:
-```bash
-python -m pytest backend/tests -v
+Run the complete collector and SaaS test suite from the repository root using the project virtual environment:
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-All 25 automated unit, integration, security, and tenant isolation tests execute in an isolated, in-memory SQLite database in under **0.5 seconds**.
+The suite covers collector lifecycle and privacy, collector-to-SaaS integration, ingestion and idempotency, anomaly and incident behavior, dashboard APIs, security, and tenant isolation. Most tests use isolated SQLite fixtures; the real HTTP integration test starts the SaaS app on a loopback socket and exercises the collector's production transport. Test count and execution time vary as coverage and the execution environment change; this project does not define a test-runtime or service-latency SLA.
 
 ---
 

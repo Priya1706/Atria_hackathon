@@ -61,7 +61,19 @@ CREATE TABLE IF NOT EXISTS incidents (
     status TEXT NOT NULL DEFAULT 'OPEN',
     first_detected_at TEXT NOT NULL,
     last_updated_at TEXT NOT NULL,
-    related_metrics_json TEXT NOT NULL
+    related_metrics_json TEXT NOT NULL,
+    lifecycle_stage TEXT NOT NULL DEFAULT 'DETECTED',
+    recovery_since TEXT
+);
+
+CREATE TABLE IF NOT EXISTS incident_lifecycle_events (
+    event_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES incidents(incident_id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    from_stage TEXT,
+    to_stage TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    reason TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS recommendations (
@@ -105,4 +117,9 @@ CREATE INDEX IF NOT EXISTS idx_health_tenant_source ON health_evaluations(tenant
 def init_db(conn: sqlite3.Connection) -> None:
     """Initializes the database tables and indexes safely without dropping data."""
     conn.executescript(DDL_SCRIPT)
+    incident_columns = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
+    if "lifecycle_stage" not in incident_columns:
+        conn.execute("ALTER TABLE incidents ADD COLUMN lifecycle_stage TEXT NOT NULL DEFAULT 'DETECTED'")
+    if "recovery_since" not in incident_columns:
+        conn.execute("ALTER TABLE incidents ADD COLUMN recovery_since TEXT")
     conn.commit()
