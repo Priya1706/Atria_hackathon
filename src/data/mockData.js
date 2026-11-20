@@ -32,7 +32,7 @@ export const mockDashboardData = {
     {
       id: "active_incidents",
       label: "Active incidents",
-      value: "03",
+      value: "—",
       change: "2 need attention",
       trend: "down",
       detail: "1 Critical Â· 2 High",

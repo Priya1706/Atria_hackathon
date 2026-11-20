@@ -3,13 +3,14 @@
 // This module defines the expected contract for the Central SaaS Dashboard API.
 // Once teammates deploy the backend, replace the mock resolver with `fetch('/api/v1/dashboard')`.
 
-import { mockDashboardData, mockCollectors, mockTenants } from "../data/mockData";
+import { mockDashboardData, mockCollectors, mockIncidents, mockTenants } from "../data/mockData";
 
 export async function getDashboardData() {
   // Simulate network latency (100ms) for realistic async lifecycle
   return new Promise((resolve) => {
     setTimeout(() => {
       const onlineCount = mockCollectors.filter((collector) => collector.status === "Online").length;
+      const activeIncidentCount = mockIncidents.filter((incident) => incident.status !== "Resolved").length;
       const stats = mockDashboardData.stats.map((item) => {
         if (item.id === "tenants") {
           return { ...item, value: String(mockTenants.length).padStart(2, "0"), change: "Sample tenant records", detail: "Count from the shared tenant dataset" };
@@ -19,6 +20,9 @@ export async function getDashboardData() {
         }
         if (item.id === "online_collectors") {
           return { ...item, value: String(onlineCount).padStart(2, "0"), change: `${((onlineCount / mockCollectors.length) * 100).toFixed(1)}% marked online`, detail: "Count from the shared collector dataset" };
+        }
+        if (item.id === "active_incidents") {
+          return { ...item, value: String(activeIncidentCount).padStart(2, "0"), change: "Open and acknowledged demo incidents", detail: "Count from the shared incident dataset" };
         }
         return item;
       });
