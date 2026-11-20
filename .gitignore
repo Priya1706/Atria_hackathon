@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+collector.db
+collector.db-shm
+collector.db-wal
+.env
