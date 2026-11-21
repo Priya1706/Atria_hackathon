@@ -1,0 +1,54 @@
+# Python environments
+.venv/
+venv/
+env/
+
+# Python runtime/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Secrets and local settings
+.env
+.env.*
+!.env.example
+*.local
+
+# Local databases/state (collector and SaaS)
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Node dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+build/
+coverage/
+
+# Logs and package manager debug output
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# IDE/editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
