@@ -1,13 +1,16 @@
-# CICADA 2026 integrated backend
+# Atria Hackathon — CICADA AIOps
 
-This repository contains two separate FastAPI applications:
+This repository contains the CICADA local collector, the central SaaS backend,
+and the React/Vite monitoring frontend. The collector transmits approved metric
+metadata to SaaS. Raw event input stays in the collector's local SQLite store.
 
-- **Local collector (Tier 1):** validates telemetry, keeps raw input local, pseudonymizes source identifiers, calculates local health/anomalies, and queues only approved metric metadata.
-- **Central SaaS backend (Tier 2):** authenticates collectors with `X-API-Key`, derives tenant identity from the key, persists telemetry, and computes central health, anomalies, incidents, and recommendations.
+## Prerequisites
 
-The integration contract is implemented at `POST /api/v1/ingest/telemetry` and described in [collector/contract.md](collector/contract.md). The two services use separate configuration and SQLite files.
+- Python 3.11 or newer and Node.js/npm compatible with `package-lock.json`
+- Windows PowerShell commands below assume the project virtual environment is
+  `.venv`
 
-## Setup (Windows PowerShell)
+## Configure the backend and collector
 
 ```powershell
 python -m venv .venv
@@ -15,68 +18,98 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 python -m pip install -r backend/requirements.txt
 Copy-Item .env.example .env
-```
-
-The root `.env` combines namespaced collector settings (`COLLECTOR_*`, `SAAS_*`) with SaaS settings (`APP_ENV`, `HOST`, `PORT`, `DATABASE_PATH`). It is ignored by Git. The collector loads it directly; the SaaS config loads the same file. Process environment values take precedence. No real credentials are included.
-
-## Provision a development collector
-
-With `APP_ENV=development` in `.env`, run:
-
-```powershell
 python -m backend.dev_provision --tenant-name "CICADA Demo" --collector-name "Local Collector"
 ```
 
-The command creates a tenant and collector in the SaaS SQLite database and prints a fresh API key once. Copy it into the ignored `.env` as `SAAS_API_KEY`. Also copy the printed tenant and collector IDs to `COLLECTOR_TENANT_ID` and `COLLECTOR_ID`. Provisioning refuses to run when `APP_ENV=production`. The backend currently stores API keys as plaintext in its local development database; do not use this MVP provisioning path for production keys.
+Provisioning prints a tenant ID, collector ID, and one-time SaaS API key. Put
+those values in the ignored `.env` as `COLLECTOR_TENANT_ID`, `COLLECTOR_ID`, and
+`SAAS_API_KEY`. Keep `SAAS_API_KEY` server-side: it must never be placed in a
+`VITE_*` variable or bundled into the frontend. Replace the placeholder
+`PSEUDONYM_SALT` with a local random value.
 
-## Start both applications
+Set `VITE_TENANT_ID` in `.env` to the provisioned tenant ID. This is a tenant
+selector, not an authentication credential. The backend frontend-facing routes
+accept `X-Tenant-ID`; the demo login does not authenticate users. Do not expose
+real customer data through this unauthenticated tenant-context mechanism.
 
-Open two PowerShell windows from the repository root.
+## Run the unified application
 
-**SaaS backend (port 8000):**
-
-```powershell
-python -m backend.main
-```
-
-**Local collector (port 8001):**
-
-```powershell
-python -m collector.main
-```
-
-The collector binds loopback at `127.0.0.1:8001` by default. SaaS binds loopback at `127.0.0.1:8000`. Swagger is at `/docs` on each service. The collector accepts plain HTTP only for localhost/loopback development; remote destinations must use HTTPS with certificate verification enabled.
-
-## Run the integrated demo
-
-After provisioning and starting both apps:
+Start each service in its own PowerShell window from the repository root:
 
 ```powershell
-Invoke-RestMethod -Method Post http://127.0.0.1:8001/collector/demo
-Invoke-RestMethod http://127.0.0.1:8001/collector/egress | ConvertTo-Json -Depth 8
-Invoke-RestMethod http://127.0.0.1:8000/api/v1/telemetry -Headers @{"X-Tenant-ID"="<tenant id from provisioning>"} | ConvertTo-Json -Depth 8
+.\.venv\Scripts\python.exe -m backend.main
 ```
 
-`/collector/demo` creates ten synthetic metric records in one privacy-filtered batch. They are invented sample values, not organizer telemetry. The collector audit shows the exact sent JSON and SHA-256. The SaaS service assigns the tenant from `SAAS_API_KEY`; tenant ID is absent from the request body.
+```powershell
+.\.venv\Scripts\python.exe -m collector.main
+```
 
-The SaaS returns `409` with `status: duplicate` for an already-processed batch. The collector treats this as successful delivery only when the returned batch ID matches. A `409` with `status: error` (for example a repeated metric UUID) remains failed and is retried; the collector does not weaken metric uniqueness.
+Then install and start the frontend:
 
-## Telemetry compatibility
+```powershell
+npm ci
+npm run dev -- --host 127.0.0.1
+```
 
-Collector exports CPU (`cpu_usage`), memory (`memory_usage`), disk (`disk_usage`), bandwidth utilization (`bandwidth_usage`), latency (`network_latency`), packet loss (`packet_loss`), connectivity, service availability, failed-authentication counts, and security-event counts. The SaaS health/anomaly engines have thresholds for all these signals; unknown metrics evaluate as `Fair`, not healthy. Bandwidth is a percent of known link capacity; a real collector adapter needs an actual counter and capacity. The demo value is synthetic.
+Open the Vite URL printed in the terminal (normally `http://127.0.0.1:5173`).
+Vite proxies `/api/*` to the SaaS backend on `127.0.0.1:8000` and `/collector/*`
+to the local collector on `127.0.0.1:8001`. The browser never receives the
+SaaS API key. `VITE_DATA_MODE=live` is the default; the visible mode control
+allows explicitly switching to sample demo data. Failed live requests show an
+error instead of silently falling back to fixtures.
 
-## API routes
+Create synthetic telemetry through the collector UI or API:
 
-Collector: `GET /health`, `/collector/status`, `/collector/metrics`, `/collector/events`, `/collector/anomalies`, `/collector/alerts`, `/collector/egress`, `/collector/egress/{batch_id}`, `/collector/queue`; `POST /collector/collect`, `/collector/demo`, `/collector/transmit`.
+```powershell
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=normal'
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8001/collector/demo?scenario=compound'
+```
 
-SaaS: `GET /health`; `POST /api/v1/ingest/telemetry`; dashboard, health, telemetry, anomalies, incidents, and recommendation routes are listed in [backend/README.md](backend/README.md).
+The collector's retry worker sends queued batches to SaaS. The frontend refreshes
+live API views periodically and shows collection, transmission, retry, and
+incident states where the APIs report them.
 
-## Tests
+## Frontend-to-backend routes
+
+| Frontend data | Actual service route | Notes |
+|---|---|---|
+| Dashboard summary | `GET /api/v1/dashboard/overview` | Tenant scoped |
+| Health by source | `GET /api/v1/health` | Tenant scoped |
+| Telemetry and infrastructure charts | `GET /api/v1/telemetry` | Tenant scoped; histories are only available for persisted samples |
+| Anomalies and alerts | `GET /api/v1/anomalies` | Alert status mutation is not available |
+| Incidents and lifecycle | `GET /api/v1/incidents`, `PATCH /api/v1/incidents/{id}` | Resolution requires verified recovery |
+| Recommendations / AIOps evidence | `GET /api/v1/recommendations`, incident response evidence | Statistical and rule based, not LLM output |
+| Local collector state | `GET /collector/status`, `/collector/metrics`, `/collector/events` | Events route returns normalized metadata only |
+| Egress audit and retry queue | `GET /collector/egress`, `/collector/queue`; `POST /collector/transmit` | Local collector only; no SaaS egress-history route exists |
+
+The tenant directory, user login, notification preferences, collector resource
+usage, detailed pipeline traces, and raw-event inspection do not have matching
+backend routes. The frontend labels or disables those views instead of
+fabricating live values. Raw-event inspection is not routed through SaaS; the
+current collector API exposes only sanitized event metadata, not raw payloads.
+
+## CORS and API configuration
+
+The Vite development proxy keeps browser requests same-origin. For direct
+frontend-to-backend deployments, configure `CORS_ORIGINS` on the SaaS service
+with explicit trusted origins. CORS does not provide authentication. The SaaS
+ingest API authenticates collectors using `X-API-Key`; dashboard APIs use the
+configured tenant context and are not a substitute for user authentication.
+
+## Verification
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
+npm ci
+npm run build
+npm run lint
 ```
 
-This runs collector and SaaS unit tests, metric compatibility and provisioning tests, in-process retry/idempotency coverage, and a real loopback HTTP integration test. The loopback test exercises the production collector transport against the SaaS app, including privacy filtering, tenant isolation, incident recommendations, recovery, and retry after a SaaS restart.
+The backend suite covers collector privacy and lifecycle, SaaS ingestion,
+idempotency, AIOps behavior, tenant isolation, and a real loopback HTTP
+collector-to-SaaS integration. Frontend build and lint commands are listed above.
 
-More details: [docs/architecture.md](docs/architecture.md), [docs/demo-guide.md](docs/demo-guide.md), and [backend/README.md](backend/README.md).
+Additional details: [backend/README.md](backend/README.md),
+[docs/architecture.md](docs/architecture.md),
+[docs/demo-guide.md](docs/demo-guide.md), and
+[collector/contract.md](collector/contract.md).

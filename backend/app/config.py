@@ -45,3 +45,10 @@ ANOMALY_COOLDOWN_SECONDS = _positive_int_env("ANOMALY_COOLDOWN_SECONDS", 300)
 CORRELATION_WINDOW_SECONDS = _positive_int_env("CORRELATION_WINDOW_SECONDS", 600)
 ANOMALY_BASELINE_WINDOW_SECONDS = _positive_int_env("ANOMALY_BASELINE_WINDOW_SECONDS", 3600)
 INCIDENT_RECOVERY_WINDOW_SECONDS = _positive_int_env("INCIDENT_RECOVERY_WINDOW_SECONDS", 300)
+CORS_ORIGINS = tuple(
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if origin.strip()
+)

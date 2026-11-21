@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -12,6 +13,7 @@ from backend.app.api.v1.incidents import router as incidents_router
 from backend.app.api.v1.recommendations import router as recommendations_router
 from backend.app.db.connection import get_db_connection
 from backend.app.db.schema import init_db
+from backend.app.config import CORS_ORIGINS
 
 
 @asynccontextmanager
@@ -33,6 +35,17 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
+)
+
+# Explicit trusted browser origins for direct deployments. The Vite development
+# proxy is same-origin and does not require CORS. No credentials are exposed to
+# the browser by this policy; collector auth remains server-to-server.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(CORS_ORIGINS),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "X-API-Key", "X-Tenant-ID", "Idempotency-Key"],
 )
 
 
