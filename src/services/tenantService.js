@@ -1,14 +1,12 @@
 import { fetchSaas } from './apiConfig.ts';
 import { isDemoMode } from './dataMode.js';
-import { mockCollectors, mockTenants } from '../data/mockData.js';
+import { mockCollectors, mockIncidents, mockTenants } from '../data/mockData.js';
+import { buildDemoTenantDirectory } from './demoDirectory.js';
 
-const demoTenant = (tenant) => {
-  const collectors = mockCollectors.filter((collector) => collector.tenant === tenant.name);
-  return { ...tenant, collectors: collectors.length, onlineCollectors: collectors.filter((collector) => collector.status === 'Online').length };
-};
+const demoTenants = () => buildDemoTenantDirectory(mockTenants, mockCollectors, mockIncidents);
 
 export async function getTenants() {
-  if (isDemoMode()) return { success: true, data: mockTenants.map(demoTenant), source: 'demo' };
+  if (isDemoMode()) return { success: true, data: demoTenants(), source: 'demo' };
   const overview = await fetchSaas('/dashboard/overview');
   const health = await fetchSaas('/health');
   const sources = health.sources || [];

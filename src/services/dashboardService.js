@@ -1,6 +1,7 @@
 import { fetchSaas, liveSource } from './apiConfig.ts';
 import { isDemoMode } from './dataMode.js';
-import { mockDashboardData, mockCollectors, mockIncidents, mockTenants } from '../data/mockData.js';
+import { mockDashboardData, mockCollectors, mockIncidents, mockTenants, mockInfrastructureData } from '../data/mockData.js';
+import { buildDemoDashboardData } from './dashboardDemo.js';
 
 const metricLabels = {
   cpu_usage: ['CPU usage', 'teal'],
@@ -10,16 +11,14 @@ const metricLabels = {
 };
 
 function demoResult() {
-  const onlineCount = mockCollectors.filter((collector) => collector.status === 'Online').length;
-  const activeIncidentCount = mockIncidents.filter((incident) => incident.status !== 'Resolved').length;
-  const stats = mockDashboardData.stats.map((item) => {
-    if (item.id === 'tenants') return { ...item, value: String(mockTenants.length).padStart(2, '0') };
-    if (item.id === 'registered_collectors') return { ...item, value: String(mockCollectors.length).padStart(2, '0') };
-    if (item.id === 'online_collectors') return { ...item, value: String(onlineCount).padStart(2, '0') };
-    if (item.id === 'active_incidents') return { ...item, value: String(activeIncidentCount).padStart(2, '0') };
-    return item;
+  const data = buildDemoDashboardData({
+    base: mockDashboardData,
+    collectors: mockCollectors,
+    incidents: mockIncidents,
+    tenants: mockTenants,
+    infrastructure: mockInfrastructureData,
   });
-  return { success: true, data: { ...mockDashboardData, stats }, ...{ source: 'demo', isLive: false } };
+  return { success: true, data, source: 'demo', isLive: false };
 }
 
 export async function getDashboardData() {
@@ -66,10 +65,10 @@ export async function getDashboardData() {
   const labels = cpu.map((row) => new Date(row.timestamp).toLocaleTimeString());
   const stat = (id, label, value, change) => ({ id, label, value: String(value), change });
   const stats = [
-    stat('tenants', 'Monitored sources', overview.total_monitored_sources, 'Current tenant only'),
-    stat('registered_collectors', 'Telemetry records', telemetry.total, 'Persisted SaaS records'),
-    stat('online_collectors', 'Unhealthy sources', overview.unhealthy_sources, `${overview.healthy_sources} healthy`),
-    stat('active_incidents', 'Active incidents', overview.active_incidents, 'Open incidents'),
+    { ...stat('tenants', 'Tenant context', overview.tenant_id ? 1 : 0, 'Current configured tenant'), route: '/tenants' },
+    { ...stat('registered_collectors', 'Registered collectors', 0, 'Configured local collector API'), route: '/collectors' },
+    { ...stat('online_collectors', 'Online collectors', 0, 'Reported by local collector API'), route: '/collectors?status=online' },
+    { ...stat('active_incidents', 'Active incidents', overview.active_incidents, 'Open incidents'), route: '/incidents?status=active' },
   ];
   return {
     success: true,
@@ -77,6 +76,7 @@ export async function getDashboardData() {
     isLive: true,
     data: {
       stats,
+      source: 'live',
       healthOverview: {
         score: overview.overall_health_score,
         overallState: overview.overall_health_status,

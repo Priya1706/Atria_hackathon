@@ -11,6 +11,8 @@ METRIC_NAMES = {
     "disk_utilization": ("disk_usage", "percent"),
     "bandwidth_utilization_percent": ("bandwidth_usage", "percent"),
     "network_latency_ms": ("network_latency", "ms"),
+    "network_bytes_sent_per_second": ("network_bytes_sent_per_second", "bytes/second"),
+    "network_bytes_received_per_second": ("network_bytes_received_per_second", "bytes/second"),
     "packet_loss_percent": ("packet_loss", "percent"),
     "connectivity": ("connectivity", "ratio"),
     "service_availability": ("service_availability", "ratio"),

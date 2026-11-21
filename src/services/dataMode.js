@@ -1,5 +1,5 @@
 const STORAGE_KEY = 'atria_data_mode';
-const defaultMode = import.meta.env.VITE_DATA_MODE === 'demo' ? 'demo' : 'live';
+const defaultMode = import.meta.env.VITE_DATA_MODE === 'live' ? 'live' : 'demo';
 
 export function getDataMode() {
   try {

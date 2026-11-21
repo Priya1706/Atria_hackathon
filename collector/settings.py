@@ -37,6 +37,7 @@ class Settings:
     retry_base_seconds: float = float(os.getenv("RETRY_BASE_SECONDS", "2"))
     retry_max_seconds: float = float(os.getenv("RETRY_MAX_SECONDS", "300"))
     retry_interval_seconds: float = float(os.getenv("RETRY_INTERVAL_SECONDS", "2"))
+    host_sampling_interval_seconds: float = max(1.0, float(os.getenv("HOST_SAMPLING_INTERVAL_SECONDS", "3")))
     pseudonym_salt: str = os.getenv("PSEUDONYM_SALT", "local-only-change-me")
     health_good_threshold: float = float(os.getenv("HEALTH_GOOD_THRESHOLD", "60"))
     health_fair_threshold: float = float(os.getenv("HEALTH_FAIR_THRESHOLD", "75"))

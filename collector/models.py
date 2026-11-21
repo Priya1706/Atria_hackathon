@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 METRICS = {
     "cpu_utilization", "memory_utilization", "disk_utilization", "bandwidth_utilization_percent", "network_latency_ms",
     "packet_loss_percent", "service_availability", "connectivity",
+    "network_bytes_sent_per_second", "network_bytes_received_per_second",
     "failed_auth_attempts", "security_event_summary",
 }
 
@@ -61,7 +62,7 @@ class TelemetryInput(BaseModel):
             raise ValueError(f"{metric} must be between 0 and 100 percent")
         if metric == "service_availability" and not 0 <= value <= 1:
             raise ValueError("service_availability must be between 0 and 1")
-        if metric in {"network_latency_ms", "failed_auth_attempts", "security_event_summary"} and value < 0:
+        if metric in {"network_latency_ms", "network_bytes_sent_per_second", "network_bytes_received_per_second", "failed_auth_attempts", "security_event_summary"} and value < 0:
             raise ValueError(f"{metric} must be non-negative")
         if metric == "connectivity" and value not in (0, 1):
             raise ValueError("connectivity must be 0 or 1")

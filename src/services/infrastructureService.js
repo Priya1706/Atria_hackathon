@@ -1,13 +1,19 @@
 import { fetchSaas } from './apiConfig.ts';
 import { isDemoMode } from './dataMode.js';
-import { mockInfrastructureData } from '../data/mockData.js';
+import { mockCollectors, mockInfrastructureData } from '../data/mockData.js';
+import { buildDemoInfrastructureData, getDemoInfrastructureNodes } from './demoInfrastructure.js';
 
-function demoResult(range) {
-  return { success: true, data: { ...mockInfrastructureData, selectedTimeRange: range }, source: 'demo' };
+function demoResult(range, nodeId) {
+  return { success: true, data: buildDemoInfrastructureData({
+    infrastructure: mockInfrastructureData,
+    collectors: mockCollectors,
+    timeRange: range,
+    nodeId,
+  }), source: 'demo' };
 }
 
 export async function getInfrastructureMetrics(timeRange = '24h', nodeId = 'all') {
-  if (isDemoMode()) return demoResult(timeRange);
+  if (isDemoMode()) return demoResult(timeRange, nodeId);
   const duration = ({ '1h': 1, '6h': 6, '24h': 24, '7d': 168 }[timeRange] || 24);
   const fromTime = new Date(Date.now() - duration * 60 * 60 * 1000).toISOString();
   const params = new URLSearchParams({ limit: '500', from_time: fromTime });
@@ -79,7 +85,7 @@ export async function getInfrastructureMetrics(timeRange = '24h', nodeId = 'all'
 }
 
 export async function getInfrastructureNodes() {
-  if (isDemoMode()) return { success: true, data: mockInfrastructureData.nodes, source: 'demo' };
+  if (isDemoMode()) return { success: true, data: getDemoInfrastructureNodes(mockCollectors), source: 'demo' };
   const telemetry = await fetchSaas('/telemetry?limit=500');
   const sources = [...new Set((telemetry.records || []).map((row) => row.source))];
   return { success: true, data: [{ id: 'all', name: 'All monitored sources' }, ...sources.map((source) => ({ id: source, name: source }))], source: 'live' };

@@ -54,8 +54,9 @@ npm run dev -- --host 127.0.0.1
 Open the Vite URL printed in the terminal (normally `http://127.0.0.1:5173`).
 Vite proxies `/api/*` to the SaaS backend on `127.0.0.1:8000` and `/collector/*`
 to the local collector on `127.0.0.1:8001`. The browser never receives the
-SaaS API key. `VITE_DATA_MODE=live` is the default; the visible mode control
-allows explicitly switching to sample demo data. Failed live requests show an
+SaaS API key. `VITE_DATA_MODE=demo` is the default so the platform opens with
+populated simulated data. Use the visible mode control to switch to live API
+data. Failed live requests show an
 error instead of silently falling back to fixtures.
 
 Create synthetic telemetry through the collector UI or API:

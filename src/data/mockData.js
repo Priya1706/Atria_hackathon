@@ -70,12 +70,6 @@ export const mockDashboardData = {
 export const mockInfrastructureData = {
   selectedTimeRange: "24h",
   lastUpdated: "12 seconds ago",
-  fleetSummary: {
-    totalHosts: 24,
-    healthyHosts: 21,
-    degradedHosts: 2,
-    criticalHosts: 1,
-  },
   nodes: [
     { id: "all", name: "Cluster Fleet Average (24 Hosts)" },
     { id: "prod-api-01", name: "prod-api-01 Â· AP-South (Ubuntu 24.04)" },
@@ -101,7 +95,7 @@ export const mockInfrastructureData = {
       { time: "12:00", value: 61 },
       { time: "15:00", value: 48 },
       { time: "18:00", value: 59 },
-      { time: "21:00", value: 42 },
+      { time: "21:00", value: 42.4 },
     ],
   },
   memory: {
@@ -168,7 +162,7 @@ export const mockInfrastructureData = {
       { time: "12:00", in: 180, out: 120, latency: 28 },
       { time: "15:00", in: 155, out: 95, latency: 25 },
       { time: "18:00", in: 170, out: 110, latency: 27 },
-      { time: "21:00", in: 142, out: 88, latency: 24 },
+      { time: "21:00", in: 142.4, out: 88.6, latency: 24.2 },
     ],
   },
 };
@@ -388,11 +382,58 @@ export const mockCollectors = [
     recentLogs: [{ timestamp: "Demo", level: status === "Online" ? "INFO" : "WARN", message: status === "Online" ? "Sample heartbeat received; no live collector connected." : "Sample collector marked offline; no live source connected." }],
     incidentsCount: status === "Online" && health === "Fair" ? 1 : 0,
   })),
-];
+].map((collector, index) => ({
+  ...collector,
+  networkLatencyMs: Number((24.2 + (((index * 7) % 24) - 11.5) * 0.4).toFixed(1)),
+  packetLossPct: [0.002, 0.004, 0.006, 0.008, 0.01, 0.012, 0.014, 0.006, 0.008, 0.01, 0.008, 0.008][index % 12],
+}));
+
+// Keep fleet-level reference metrics equal to the mean of the online collector readings.
+for (const [field, target] of [
+  ["cpuUsage", mockInfrastructureData.cpu.current],
+  ["memoryUsage", mockInfrastructureData.memory.currentPercent],
+  ["diskUsage", mockInfrastructureData.disk.currentPercent],
+]) {
+  const online = mockCollectors.filter((collector) => collector.status === "Online");
+  const values = online.map((collector) => Number.parseFloat(collector[field]));
+  const scale = target * values.length / values.reduce((sum, value) => sum + value, 0);
+  const adjusted = values.map((value) => Number((value * scale).toFixed(1)));
+  const targetTotal = Number((target * adjusted.length).toFixed(1));
+  const actualTotal = Number(adjusted.reduce((sum, value) => sum + value, 0).toFixed(1));
+  adjusted[0] = Number((adjusted[0] + targetTotal - actualTotal).toFixed(1));
+  let index = 0;
+  for (const collector of mockCollectors) {
+    if (collector.status === "Online") collector[field] = `${adjusted[index++].toFixed(1)}%`;
+  }
+}
+
+// Derive the infrastructure fleet summary from the same simulated collector records.
+const simulatedCollectorHealth = mockCollectors.reduce((counts, collector) => {
+  counts[collector.health] = (counts[collector.health] || 0) + 1;
+  return counts;
+}, {});
+mockInfrastructureData.fleetSummary = {
+  totalHosts: mockCollectors.length,
+  healthyHosts: (simulatedCollectorHealth.Excellent || 0) + (simulatedCollectorHealth.Good || 0),
+  degradedHosts: simulatedCollectorHealth.Fair || 0,
+  criticalHosts: simulatedCollectorHealth.Poor || 0,
+};
+mockInfrastructureData.sourceCount = mockCollectors.length;
+mockInfrastructureData.recordCount = [
+  mockInfrastructureData.cpu.history,
+  mockInfrastructureData.memory.history,
+  mockInfrastructureData.disk.history,
+  mockInfrastructureData.network.history,
+].reduce((total, history) => total + history.length, 0);
+const infrastructureSampleTimes = mockInfrastructureData.cpu.history.map((point) => point.time);
+mockInfrastructureData.lastUpdated = `Simulated sample window · ${infrastructureSampleTimes[0]}–${infrastructureSampleTimes[infrastructureSampleTimes.length - 1]}`;
 
 export const mockIncidents = [
   {
     id: "INC-2048",
+    tenant: "Northstar Systems",
+    tenantId: "tenant-northstar-demo",
+    collectorId: "COL-002",
     title: "High memory utilization on production worker pool",
     severity: "Critical",
     status: "Open",
@@ -412,6 +453,9 @@ export const mockIncidents = [
   },
   {
     id: "INC-2047",
+    tenant: "Vertex Cloud",
+    tenantId: "tenant-vertex-demo",
+    collectorId: "COL-003",
     title: "Collector heartbeat delayed / timeout",
     severity: "High",
     status: "Acknowledged",
@@ -431,6 +475,9 @@ export const mockIncidents = [
   },
   {
     id: "INC-2046",
+    tenant: "Acme Technologies",
+    tenantId: "tenant-acme-demo",
+    collectorId: "COL-001",
     title: "Elevated network latency & packet jitter in AP-South",
     severity: "Medium",
     status: "Open",
@@ -449,6 +496,9 @@ export const mockIncidents = [
   },
   {
     id: "INC-2045",
+    tenant: "Aster Manufacturing",
+    tenantId: "tenant-aster-demo",
+    collectorId: "COL-010",
     title: "Rapid storage volume exhaustion on database logs mount",
     severity: "High",
     status: "Resolved",
@@ -469,6 +519,9 @@ export const mockIncidents = [
   },
   {
     id: "INC-2044",
+    tenant: "Acme Technologies",
+    tenantId: "tenant-acme-demo",
+    collectorId: "COL-001",
     title: "Unusual CPU spike detected across API container pool",
     severity: "Low",
     status: "Resolved",
@@ -490,6 +543,9 @@ export const mockIncidents = [
 export const mockAlerts = [
   {
     id: "ALT-1094",
+    tenant: "Northstar Systems",
+    tenantId: "tenant-northstar-demo",
+    collectorId: "COL-002",
     title: "Heap Allocation Exceeded 92% on Order Processing",
     severity: "Critical",
     category: "Memory",
@@ -501,6 +557,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1092",
+    tenant: "Northstar Systems",
+    tenantId: "tenant-northstar-demo",
+    collectorId: "COL-002",
     title: "System Memory Above 90% Watermark",
     severity: "Critical",
     category: "Memory",
@@ -512,6 +571,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1088",
+    tenant: "Vertex Cloud",
+    tenantId: "tenant-vertex-demo",
+    collectorId: "COL-003",
     title: "Collector Missed 3 Successive Heartbeats",
     severity: "High",
     category: "Collector",
@@ -523,6 +585,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1079",
+    tenant: "Acme Technologies",
+    tenantId: "tenant-acme-demo",
+    collectorId: "COL-001",
     title: "Egress P99 Network Latency > 120ms",
     severity: "Medium",
     category: "Network",
@@ -534,6 +599,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1065",
+    tenant: "Aster Manufacturing",
+    tenantId: "tenant-aster-demo",
+    collectorId: "COL-010",
     title: "Disk Usage on /var/log Exceeded 85%",
     severity: "High",
     category: "Storage",
@@ -545,6 +613,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1051",
+    tenant: "Acme Technologies",
+    tenantId: "tenant-acme-demo",
+    collectorId: "COL-001",
     title: "CPU Utilization Exceeded 80% on API Gateway",
     severity: "Low",
     category: "Compute",
@@ -556,6 +627,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1048",
+    tenant: "Northstar Systems",
+    tenantId: "tenant-northstar-demo",
+    collectorId: "COL-002",
     title: "TCP Packet Drop Rate Elevated on Interface eth0",
     severity: "Low",
     category: "Network",
@@ -567,6 +641,9 @@ export const mockAlerts = [
   },
   {
     id: "ALT-1040",
+    tenant: "Acme Technologies",
+    tenantId: "tenant-acme-demo",
+    collectorId: "COL-006",
     title: "SSL/TLS Certificate Expiration Warning (14 Days)",
     severity: "Medium",
     category: "Security",
@@ -901,3 +978,9 @@ export const mockTenants = [
   { id: "TEN-011", name: "Harborline Media", tenantId: "tenant-harborline-demo", registeredAt: "2026-08-02", health: "Good", status: "Active" },
   { id: "TEN-012", name: "Orchard Health Group", tenantId: "tenant-orchard-demo", registeredAt: "2026-08-16", health: "Excellent", status: "Active" },
 ];
+
+// Attach stable tenant IDs to the shared collector fixtures for directory joins.
+const tenantIdByName = new Map(mockTenants.map((tenant) => [tenant.name, tenant.tenantId]));
+for (const collector of mockCollectors) {
+  collector.tenantId = tenantIdByName.get(collector.tenant);
+}
